@@ -1,0 +1,96 @@
+name: CI
+on:
+  # Build all branches, ignore all tags.
+  push:
+    branches:
+      - "*"
+    tags-ignore:
+      - "*"
+  pull_request:
+    branches:
+      - "*"
+    tags-ignore:
+      - "*"
+jobs:
+  lint:
+    name: Cargo Fmt
+    strategy:
+      fail-fast: true
+    runs-on: ubuntu-latest
+    container:
+      image: rust:latest
+    steps:
+      - name: Setup | Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup | Deps
+        run: |
+          rustup component add clippy
+          rustup component add rustfmt
+
+      - name: Setup | Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-
+
+      - name: Build | Clippy
+        run: cargo clippy --all-features
+
+      - name: Build | Rustfmt
+        run: cargo fmt --check
+
+  check:
+    name: Cargo Check
+    strategy:
+      fail-fast: true
+    runs-on: ubuntu-latest
+    container:
+      image: rust:latest
+    steps:
+      - name: Setup | Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup | Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-
+
+      - name: Build | Check
+        run: cargo check --all
+
+  test:
+    name: Cargo Test
+    strategy:
+      fail-fast: true
+    runs-on: ubuntu-latest
+    container:
+      image: rust:latest
+    steps:
+      - name: Setup | Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup | Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-
+
+      - name: Build | Test
+        run: cargo test
