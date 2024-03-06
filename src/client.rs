@@ -5,17 +5,16 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use kafka_protocol::{
     indexmap::IndexMap,
-    messages::{produce_request::PartitionProduceData, BrokerId, ProduceRequest},
+    messages::{produce_request::PartitionProduceData, ProduceRequest},
     protocol::StrBytes,
     records::{Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType},
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::{CancellationToken, DropGuard};
 
-use crate::{
-    broker::{BrokerRequestError, BrokerResponse},
-    clitask::{ClientTask, ClusterMeta, Msg},
-};
+use crate::broker::BrokerResponse;
+use crate::clitask::{ClientTask, ClusterMeta, Msg};
+use crate::error::ClientError;
 
 /*
 - TODO: build a TopicBatcher on top of a TopicProducer which works like a sink,
@@ -34,6 +33,11 @@ pub type MessageHeaders = IndexMap<StrBytes, Option<Bytes>>;
 ///
 /// This client is `Send + Sync + Clone`, and cloning this client to share it among application
 /// tasks is encouraged.
+///
+/// This client spawns a task which manages the full lifecycle of interaction with a Kafka cluster,
+/// include initial broker connections based on seed list, cluster metadata discovery, connections
+/// to new brokers, establish API versions of brokers, handling reconnects, and anything else
+/// related to maintain connections to a Kafka cluster.
 #[derive(Clone)]
 pub struct Client {
     /// The channel used for communicating with the client task.
@@ -111,35 +115,7 @@ pub enum Acks {
     Leader = 1,
 }
 
-/// Client errors from interacting with a Kafka cluster.
-#[derive(Debug, thiserror::Error)]
-pub enum ClientError {
-    /// Error while interacting with a broker.
-    #[error("error while interacting with a broker: {0:?}")]
-    BrokerError(BrokerRequestError),
-    /// The client is disconnected.
-    #[error("the client is disconnected")]
-    Disconnected,
-    /// Error while encoding a batch of records.
-    #[error("error while encoding a batch of records: {0}")]
-    EncodingError(String),
-    /// The specified topic has no available partitions.
-    #[error("the specified topic has no available partitions: {0}")]
-    NoPartitionsAvailable(String),
-    /// A broker has disappeared from the cluster during client operations.
-    ///
-    /// Typically, application code should just retry the request in the face of this error.
-    #[error("broker has disappeared from the cluster during client operations: {0:?}")]
-    UnknownBroker(BrokerId),
-    /// The specified topic is unknown to the cluster.
-    #[error("the specified topic is unknown to the cluster: {0}")]
-    UnknownTopic(String),
-}
-
 /// A producer for a specific topic.
-///
-/// This producer is `Send + Sync + Clone`, and cloning this producer to share it among application
-/// tasks is encouraged.
 pub struct TopicProducer {
     /// The client handle from which this producer was created.
     _client: Client,
