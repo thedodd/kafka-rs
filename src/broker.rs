@@ -1,65 +1,46 @@
 //! Kafka connection interface.
 
+use std::sync::Arc;
 use std::{collections::BTreeMap, time::Duration};
 
 use anyhow::{Context, Result};
-use futures::{future::Fuse, prelude::*};
+use futures::prelude::*;
 use kafka_protocol::{
-    messages::{metadata_response::MetadataResponseBroker, ApiKey, ApiVersionsRequest, MetadataRequest, MetadataResponse, RequestHeader, RequestKind, ResponseHeader, ResponseKind},
+    messages::{metadata_response::MetadataResponseBroker, ApiKey, ApiVersionsRequest, MetadataRequest, ProduceRequest, RequestHeader, RequestKind, ResponseHeader, ResponseKind},
     protocol::{Decodable, Message, Request as RequestProto, VersionRange},
 };
-use tokio::{
-    net::TcpStream,
-    sync::{mpsc, oneshot},
-    time::timeout,
-};
+use tokio::{net::TcpStream, sync::mpsc, time::timeout};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::codec::{self, KafkaReader, KafkaWriter, Request, Response};
 
 /* TODO:
-- update tracing with host info.
-- update error types so that the public interface can take structures actions based on variants.
+- use timer queue for timeouts of outstanding requests.
 */
 
-type MsgTx = oneshot::Sender<Result<(ResponseHeader, ResponseKind)>>;
-type MsgRx = oneshot::Receiver<Result<(ResponseHeader, ResponseKind)>>;
-type FusedRx = Fuse<MsgRx>;
-type ResultRx = Result<(ResponseHeader, ResponseKind)>;
+/// A result from a broker interaction.
+pub(crate) type BrokerResult<T> = Result<T, BrokerRequestError>;
+/// The channel type used for getting responses from a broker connection.
+pub(crate) type MsgTx = mpsc::UnboundedSender<BrokerResponse>;
 
-/// Metadata on a broker, used for establishing connections.
-#[derive(Debug)]
-pub(crate) enum BrokerMeta {
-    Meta(MetadataResponseBroker),
-    Host(String),
-}
-
-impl BrokerMeta {
-    /// Get the connection string to be used for connecting to this broker.
-    pub(crate) fn connection_string(&self) -> String {
-        match self {
-            Self::Meta(meta) => format!("{}:{}", meta.host.as_str(), meta.port),
-            Self::Host(host) => host.clone(),
-        }
-    }
-}
-
-impl From<String> for BrokerMeta {
-    fn from(value: String) -> Self {
-        Self::Host(value)
-    }
-}
-
-impl From<MetadataResponseBroker> for BrokerMeta {
-    fn from(value: MetadataResponseBroker) -> Self {
-        Self::Meta(value)
-    }
+/// A response from a broker along with the UUID of the original request.
+///
+/// In the case of an error, the result error variant will include the original payload, which can
+/// be used for retries and the like.
+pub(crate) struct BrokerResponse {
+    /// The ID of the original request.
+    pub(crate) id: uuid::Uuid,
+    /// The result from the broker.
+    pub(crate) result: BrokerResult<(ResponseHeader, ResponseKind)>,
 }
 
 pub(crate) enum Msg {
-    // GetApiVersions(MsgTx),
-    GetMetadata(MsgTx),
+    GetMetadata(uuid::Uuid, MsgTx),
+    Produce(uuid::Uuid, ProduceRequest, MsgTx),
 }
+
+/// A handle to a broker connection.
+pub(crate) type BrokerPtr = Arc<Broker>;
 
 /// A handle to a broker connection.
 pub(crate) struct Broker {
@@ -69,43 +50,27 @@ pub(crate) struct Broker {
 
 impl Broker {
     /// Create a new instance.
-    pub(crate) fn new<T: Into<BrokerMeta>>(broker: T) -> Self {
+    pub(crate) fn new<T: Into<BrokerConnInfo>>(broker: T) -> BrokerPtr {
         let (tx, rx) = mpsc::channel(1_000);
         let shutdown = CancellationToken::new();
         let task = BrokerTask::new(broker.into(), rx, shutdown.clone());
         tokio::spawn(task.run());
-        Broker {
+        Arc::new(Self {
             chan: tx,
             _shutdown: shutdown.drop_guard(),
-        }
+        })
     }
 
-    // /// Get the API versions supported by this broker.
-    // ///
-    // /// TODO: this is probably not needed as a public interface, maybe remove it soon.
-    // pub(crate) async fn get_api_versions(&self) -> Result<ApiVersionsResponse> {
-    //     let (tx, rx) = oneshot::channel();
-    //     self.chan.send(Msg::GetApiVersions(tx)).await.context("connection closed")?;
-    //     let (_header, body) = match rx.await {
-    //         Ok(Ok(res)) => res,
-    //         Ok(Err(err)) => todo!(),
-    //         Err(closed) => todo!(),
-    //     };
-    //     let ResponseKind::ApiVersionsResponse(res) = body else { todo!() };
-    //     Ok(res)
-    // }
-
     /// Get the cluster's metadata according to this broker (should be uniform across all brokers).
-    pub(crate) async fn get_metadata(&self) -> Result<MetadataResponse> {
-        let (tx, rx) = oneshot::channel();
-        self.chan.send(Msg::GetMetadata(tx)).await.context("connection closed")?;
-        let (_header, body) = match rx.await {
-            Ok(Ok(res)) => res,
-            Ok(Err(err)) => anyhow::bail!(err),
-            Err(_closed) => anyhow::bail!("connection closed while waiting for response"),
-        };
-        let ResponseKind::MetadataResponse(res) = body else { todo!() };
-        Ok(res)
+    pub(crate) async fn get_metadata(&self, id: uuid::Uuid, tx: MsgTx) {
+        let _ = self.chan.send(Msg::GetMetadata(id, tx)).await; // Unreachable error case.
+    }
+
+    /// Produce data to the broker.
+    ///
+    /// If the request fails, the original request payload is returned.
+    pub(crate) async fn produce(&self, id: uuid::Uuid, req: ProduceRequest, tx: MsgTx) {
+        let _ = self.chan.send(Msg::Produce(id, req.clone(), tx)).await; // Unreachable error case.
     }
 }
 
@@ -120,7 +85,7 @@ enum BrokerState {
 /// The core state of a broker connection.
 struct BrokerTask {
     /// Metadata on the target broker.
-    broker: BrokerMeta,
+    broker: BrokerConnInfo,
     /// The channel used for communicating with this connection.
     chan: mpsc::Receiver<Msg>,
     /// A shutdown signal for this broker connection.
@@ -129,14 +94,14 @@ struct BrokerTask {
     /// All supported API versions of this broker.
     api_versions: BTreeMap<i16, (i16, i16)>,
     /// All outstanding requests on this connection, indexed by correlation ID.
-    requests: BTreeMap<i32, PendingResponse>,
+    requests: BTreeMap<i32, OutboundRequest>,
     /// The next correlation ID to use, eventually wrapping.
     next_correlation_id: i32,
 }
 
 impl BrokerTask {
     /// Create a new instance.
-    fn new(broker: BrokerMeta, chan: mpsc::Receiver<Msg>, shutdown: CancellationToken) -> Self {
+    fn new(broker: BrokerConnInfo, chan: mpsc::Receiver<Msg>, shutdown: CancellationToken) -> Self {
         Self {
             broker,
             chan,
@@ -173,8 +138,26 @@ impl BrokerTask {
     async fn handle_msg(&mut self, writer: &mut KafkaWriter, msg: Msg) -> Result<()> {
         match msg {
             // Msg::GetApiVersions(tx) => self.handle_get_api_versions(Some(tx)).await,
-            Msg::GetMetadata(tx) => self.handle_get_metadata(writer, Some(tx)).await,
+            Msg::GetMetadata(id, tx) => self.get_metadata(writer, id, Some(tx)).await,
+            Msg::Produce(id, req, tx) => self.produce(writer, id, req, Some(tx)).await,
         }
+    }
+
+    /// Write the request to the broker, and queue for response.
+    async fn write(&mut self, writer: &mut KafkaWriter, cid: i32, req: OutboundRequest) -> Result<()> {
+        if let Err(err) = writer.send(&req.request).await.context("error sending request to broker") {
+            if let Some(chan) = req.chan.as_ref() {
+                let req_err = BrokerRequestError {
+                    payload: req.request.kind,
+                    kind: BrokerErrorKind::Disconnected,
+                };
+                let _ = chan.send(BrokerResponse { id: req.id, result: Err(req_err) });
+            }
+            return Err(err);
+        }
+
+        self.requests.insert(cid, req);
+        Ok(())
     }
 
     /// Fetch API versions info from this broker.
@@ -193,29 +176,21 @@ impl BrokerTask {
         header.request_api_key = api_key as i16;
         header.request_api_version = supported_versions.max;
         header.correlation_id = correlation_id;
-        let req = ApiVersionsRequest::default();
-        writer
-            .send(Request {
-                header,
-                kind: RequestKind::ApiVersionsRequest(req),
-            })
-            .await
-            .context("error sending request to broker")?;
-        writer.flush().await.context("error flushing sink")?;
 
-        self.requests.insert(
-            correlation_id,
-            PendingResponse {
-                _id: correlation_id,
-                api_version: supported_versions.max,
-                api_key,
-                chan,
+        let req = OutboundRequest {
+            id: uuid::Uuid::new_v4(),
+            request: Request {
+                header,
+                kind: RequestKind::ApiVersionsRequest(ApiVersionsRequest::default()),
             },
-        );
-        Ok(())
+            api_version: supported_versions.max,
+            api_key,
+            chan,
+        };
+        self.write(writer, correlation_id, req).await
     }
 
-    async fn handle_get_metadata(&mut self, writer: &mut KafkaWriter, chan: Option<MsgTx>) -> Result<()> {
+    async fn get_metadata(&mut self, writer: &mut KafkaWriter, id: uuid::Uuid, chan: Option<MsgTx>) -> Result<()> {
         let correlation_id = self.next_correlation_id;
         self.next_correlation_id = self.next_correlation_id.wrapping_add(1);
 
@@ -228,26 +203,45 @@ impl BrokerTask {
         header.request_api_key = api_key as i16;
         header.request_api_version = supported_versions.max;
         header.correlation_id = correlation_id;
-        let req = MetadataRequest::default();
-        writer
-            .send(Request {
-                header,
-                kind: RequestKind::MetadataRequest(req),
-            })
-            .await
-            .context("error sending request to broker")?;
-        writer.flush().await.context("error flushing sink")?;
 
-        self.requests.insert(
-            correlation_id,
-            PendingResponse {
-                _id: correlation_id,
-                api_version: supported_versions.max,
-                api_key,
-                chan,
+        let req = OutboundRequest {
+            id,
+            request: Request {
+                header,
+                kind: RequestKind::MetadataRequest(MetadataRequest::default()),
             },
-        );
-        Ok(())
+            api_version: supported_versions.max,
+            api_key,
+            chan,
+        };
+        self.write(writer, correlation_id, req).await
+    }
+
+    async fn produce(&mut self, writer: &mut KafkaWriter, id: uuid::Uuid, req: ProduceRequest, chan: Option<MsgTx>) -> Result<()> {
+        let correlation_id = self.next_correlation_id;
+        self.next_correlation_id = self.next_correlation_id.wrapping_add(1);
+
+        let (min, max) = self.api_versions.get(&ProduceRequest::KEY).copied().unwrap_or((0, 0));
+        let supported_versions = ProduceRequest::VERSIONS.intersect(&VersionRange { min, max });
+        tracing::debug!(?supported_versions, correlation_id, "sending produce request");
+
+        let api_key = ApiKey::ProduceKey;
+        let mut header = RequestHeader::default();
+        header.request_api_key = api_key as i16;
+        header.request_api_version = supported_versions.max;
+        header.correlation_id = correlation_id;
+
+        let req = OutboundRequest {
+            id,
+            request: Request {
+                header,
+                kind: RequestKind::ProduceRequest(req),
+            },
+            api_version: supported_versions.max,
+            api_key,
+            chan,
+        };
+        self.write(writer, correlation_id, req).await
     }
 
     /// Handle a response from the broker.
@@ -258,7 +252,13 @@ impl BrokerTask {
         let header_version = pending.api_key.response_header_version(pending.api_version);
         let Ok(response_header) = ResponseHeader::decode(&mut resp.body, header_version) else {
             if let Some(chan) = pending.chan {
-                let _ = chan.send(Err(anyhow::anyhow!("unable to decode response header")));
+                let _ = chan.send(BrokerResponse {
+                    id: pending.id,
+                    result: Err(BrokerRequestError {
+                        payload: pending.request.kind,
+                        kind: BrokerErrorKind::MalformedBrokerResponse,
+                    }),
+                });
             }
             return;
         };
@@ -335,10 +335,21 @@ impl BrokerTask {
             ApiKey::ListTransactionsKey => ListTransactionsResponse::decode(&mut resp.body, pending.api_version).map(ResponseKind::ListTransactionsResponse),
             ApiKey::AllocateProducerIdsKey => AllocateProducerIdsResponse::decode(&mut resp.body, pending.api_version).map(ResponseKind::AllocateProducerIdsResponse),
         };
-        let res = res.context("unable to decode response header").map(|response_body| (response_header, response_body));
+        let Ok(response_body) = res else {
+            if let Some(chan) = pending.chan {
+                let _ = chan.send(BrokerResponse {
+                    id: pending.id,
+                    result: Err(BrokerRequestError {
+                        payload: pending.request.kind,
+                        kind: BrokerErrorKind::MalformedBrokerResponse,
+                    }),
+                });
+            }
+            return;
+        };
 
         // If this is an API versions response, always update our local cache of version info.
-        if let Ok((_, ResponseKind::ApiVersionsResponse(res))) = &res {
+        if let ResponseKind::ApiVersionsResponse(res) = &response_body {
             if res.error_code == 0 {
                 self.api_versions.clear();
                 for (key, ver) in res.api_keys.iter() {
@@ -349,7 +360,10 @@ impl BrokerTask {
         }
 
         if let Some(chan) = pending.chan {
-            let _ = chan.send(res);
+            let _ = chan.send(BrokerResponse {
+                id: pending.id,
+                result: Ok((response_header, response_body)),
+            });
         }
     }
 }
@@ -363,6 +377,10 @@ impl BrokerConnecting {
     #[tracing::instrument(level = "trace", parent = None, skip_all, fields(broker=?self.inner.broker))]
     async fn run(mut self) -> BrokerState {
         tracing::trace!("connecting to broker");
+
+        // In the case of a reconnect, drain pending requests.
+        self.drain_pending_requests().await;
+
         let shutdown = self.inner.shutdown.clone();
         loop {
             let res = tokio::select! {
@@ -396,6 +414,21 @@ impl BrokerConnecting {
 
         // Wrap TCP stream in framed codecs.
         Ok(codec::new_kafka_transport(conn, None))
+    }
+
+    /// Drain any pending requests upon reconnect.
+    async fn drain_pending_requests(&mut self) {
+        while let Some((_, req)) = self.inner.requests.pop_first() {
+            if let Some(chan) = req.chan {
+                let _ = chan.send(BrokerResponse {
+                    id: req.id,
+                    result: Err(BrokerRequestError {
+                        payload: req.request.kind,
+                        kind: BrokerErrorKind::Disconnected,
+                    }),
+                });
+            }
+        }
     }
 }
 
@@ -432,11 +465,11 @@ impl BrokerVersioning {
 
     async fn try_get_api_versions(&mut self) -> Result<()> {
         // Fetch initial API versions info for the broker.
-        let (tx, rx) = oneshot::channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         self.inner.get_api_versions(&mut self.writer, Some(tx)).await.context("broker connection lost, reconnecting")?;
 
         // Wait for an API versions response with a timeout.
-        let fut = timeout(Duration::from_secs(10), rx);
+        let fut = timeout(Duration::from_secs(10), rx.recv());
         tokio::pin!(fut);
         loop {
             tokio::select! {
@@ -444,7 +477,8 @@ impl BrokerVersioning {
                     res
                         .context("timeout while waiting for api versions response")?
                         .context("channel dropped while awaiting api versions response")?
-                        .context("error in api versions response from broker")?;
+                        .result?;
+                        // .context("error in api versions response from broker")?;
                     return Ok(());
                 },
                 opt_res = self.reader.next() => {
@@ -482,13 +516,66 @@ impl BrokerReady {
     }
 }
 
-struct PendingResponse {
-    /// The correlation ID of the corresponding request.
-    _id: i32,
+/// An outbound request to be sent to a broker.
+struct OutboundRequest {
+    /// The application ID of the corresponding request (not the correlation ID for the broker).
+    id: uuid::Uuid,
+    /// The original request.
+    request: Request,
     /// The API key of the corresponding request.
     api_key: ApiKey,
     /// The API version of the corresponding request.
     api_version: i16,
     /// The channel used to send the finalized response.
     chan: Option<MsgTx>,
+}
+
+/// Metadata on a broker, used for establishing connections.
+#[derive(Debug)]
+pub(crate) enum BrokerConnInfo {
+    Meta(MetadataResponseBroker),
+    Host(String),
+}
+
+impl BrokerConnInfo {
+    /// Get the connection string to be used for connecting to this broker.
+    pub(crate) fn connection_string(&self) -> String {
+        match self {
+            Self::Meta(meta) => format!("{}:{}", meta.host.as_str(), meta.port),
+            Self::Host(host) => host.clone(),
+        }
+    }
+}
+
+impl From<String> for BrokerConnInfo {
+    fn from(value: String) -> Self {
+        Self::Host(value)
+    }
+}
+
+impl From<MetadataResponseBroker> for BrokerConnInfo {
+    fn from(value: MetadataResponseBroker) -> Self {
+        Self::Meta(value)
+    }
+}
+
+/// Broker connection level error.
+#[derive(Debug, thiserror::Error)]
+#[error("broker connection error: {kind:?}")]
+pub struct BrokerRequestError {
+    /// The original request payload.
+    pub(crate) payload: RequestKind,
+    /// The kind of error which has taken place.
+    pub(crate) kind: BrokerErrorKind,
+}
+
+/// Broker connection level error kind.
+#[derive(Debug, thiserror::Error)]
+pub enum BrokerErrorKind {
+    /// The connection to the broker has terminated.
+    #[error("the client is disconnected")]
+    Disconnected,
+    /// The broker returned a malformed response.
+    #[error("the broker returned a malformed response")]
+    MalformedBrokerResponse,
 }

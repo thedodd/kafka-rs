@@ -61,10 +61,10 @@ pub(crate) struct Request {
     pub kind: RequestKind,
 }
 
-impl Encoder<Request> for KafkaCodecWriter {
+impl Encoder<&'_ Request> for KafkaCodecWriter {
     type Error = anyhow::Error;
 
-    fn encode(&mut self, item: Request, dst: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode(&mut self, item: &'_ Request, dst: &mut BytesMut) -> Result<(), Self::Error> {
         // Compute the encoding size of the header.
         let key = ApiKey::try_from(item.header.request_api_key).map_err(|_| anyhow::anyhow!("unknown API key"))?;
         let header_version = key.request_header_version(item.header.request_api_version);

@@ -1,11 +1,13 @@
-use kafka_rs::Client;
+use anyhow::{Context, Result};
+use bytes::Bytes;
+use kafka_rs::{Acks, Client, Compression, Message};
 use tracing_subscriber::prelude::*;
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() {
+async fn main() -> Result<()> {
     tracing_subscriber::registry()
         // Filter spans based on the RUST_LOG env var.
-        .with(tracing_subscriber::EnvFilter::new("error,kafka_rs=trace"))
+        .with(tracing_subscriber::EnvFilter::new("error,kafka_rs=debug"))
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(false) // Too verbose, so disable target.
@@ -17,5 +19,8 @@ async fn main() {
         .expect("error initializing tracing");
 
     let cli = Client::new(vec!["localhost:9092".into()]);
-    tokio::time::sleep(std::time::Duration::from_secs(70)).await;
+    let mut producer = cli.topic_producer("testing", Acks::All, None, Some(Compression::Snappy));
+
+    let messages = vec![Message::new(Some("key0".into()), Some(Bytes::from_static(b"val0")), Default::default())];
+    producer.produce(&messages).await.context("error producing data to cluster")
 }
