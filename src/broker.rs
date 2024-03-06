@@ -13,6 +13,7 @@ use tokio::{net::TcpStream, sync::mpsc, time::timeout};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::codec::{self, KafkaReader, KafkaWriter, Request, Response};
+use crate::error::{BrokerErrorKind, BrokerRequestError};
 
 /* TODO:
 - use timer queue for timeouts of outstanding requests.
@@ -557,25 +558,4 @@ impl From<MetadataResponseBroker> for BrokerConnInfo {
     fn from(value: MetadataResponseBroker) -> Self {
         Self::Meta(value)
     }
-}
-
-/// Broker connection level error.
-#[derive(Debug, thiserror::Error)]
-#[error("broker connection error: {kind:?}")]
-pub struct BrokerRequestError {
-    /// The original request payload.
-    pub(crate) payload: RequestKind,
-    /// The kind of error which has taken place.
-    pub(crate) kind: BrokerErrorKind,
-}
-
-/// Broker connection level error kind.
-#[derive(Debug, thiserror::Error)]
-pub enum BrokerErrorKind {
-    /// The connection to the broker has terminated.
-    #[error("the client is disconnected")]
-    Disconnected,
-    /// The broker returned a malformed response.
-    #[error("the broker returned a malformed response")]
-    MalformedBrokerResponse,
 }
