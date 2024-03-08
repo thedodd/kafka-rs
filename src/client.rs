@@ -210,6 +210,7 @@ impl TopicProducer {
         });
         self.buf.reserve(size);
         RecordBatchEncoder::encode(&mut self.buf, self.batch_buf.iter(), &self.encode_opts).map_err(|err| ClientError::EncodingError(format!("{:?}", err)))?;
+        self.batch_buf.clear();
 
         // Create the request object for the broker.
         let mut req = ProduceRequest::default();
