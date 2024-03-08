@@ -5,7 +5,7 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use kafka_protocol::{
     indexmap::IndexMap,
-    messages::{produce_request::PartitionProduceData, ProduceRequest},
+    messages::{produce_request::PartitionProduceData, ProduceRequest, ResponseKind},
     protocol::StrBytes,
     records::{Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType},
 };
@@ -146,13 +146,14 @@ pub struct TopicProducer {
 
 impl TopicProducer {
     /// Produce a batch of records to the specified topic.
-    pub async fn produce(&mut self, messages: &[Message]) -> Result<()> {
+    pub async fn produce(&mut self, messages: &[Message]) -> Result<(i64, i64)> {
         // TODO: allow for producer to specify partition instead of using sticky rotating partitions.
 
         // Check for topic metadata.
         if messages.is_empty() {
-            return Ok(());
+            return Err(ClientError::ProducerMessagesEmpty);
         }
+        self.batch_buf.clear(); // Ensure buf is clear.
         let mut cluster = self.cluster.load();
         if !*cluster.bootstrap.borrow() {
             let mut sig = cluster.bootstrap.clone();
@@ -209,8 +210,9 @@ impl TopicProducer {
             acc
         });
         self.buf.reserve(size);
-        RecordBatchEncoder::encode(&mut self.buf, self.batch_buf.iter(), &self.encode_opts).map_err(|err| ClientError::EncodingError(format!("{:?}", err)))?;
+        let res = RecordBatchEncoder::encode(&mut self.buf, self.batch_buf.iter(), &self.encode_opts).map_err(|err| ClientError::EncodingError(format!("{:?}", err)));
         self.batch_buf.clear();
+        res?;
 
         // Create the request object for the broker.
         let mut req = ProduceRequest::default();
@@ -236,7 +238,23 @@ impl TopicProducer {
 
         // Handle response.
         res.result
-            .map(|response| tracing::debug!(?response, "success producing data to topic partition"))
             .map_err(ClientError::BrokerError)
+            .and_then(|res| {
+                // Unpack the expected response type.
+                if let ResponseKind::ProduceResponse(inner) = res.1 {
+                    Ok(inner)
+                } else {
+                    tracing::error!("expected broker to return a ProduceResponse, got: {:?}", res.1);
+                    Err(ClientError::MalformedResponse)
+                }
+            })
+            .and_then(|res| {
+                // Unpack the base offset & calculate the final offset.
+                res.responses
+                    .iter()
+                    .find(|topic| topic.0 .0 == self.topic)
+                    .and_then(|val| val.1.partition_responses.first().map(|val| (val.base_offset, val.base_offset + messages.len() as i64)))
+                    .ok_or(ClientError::MalformedResponse)
+            })
     }
 }
