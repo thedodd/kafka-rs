@@ -22,5 +22,7 @@ async fn main() -> Result<()> {
     let mut producer = cli.topic_producer("testing", Acks::All, None, Some(Compression::Snappy));
 
     let messages = vec![Message::new(Some("key0".into()), Some(Bytes::from_static(b"val0")), Default::default())];
-    producer.produce(&messages).await.context("error producing data to cluster")
+    let (first_offset, last_offset) = producer.produce(&messages).await.context("error producing data to cluster")?;
+    tracing::info!("first_offset={}; last_offset={}", first_offset, last_offset);
+    Ok(())
 }

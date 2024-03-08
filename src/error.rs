@@ -11,9 +11,15 @@ pub enum ClientError {
     /// Error while encoding a batch of records.
     #[error("error while encoding a batch of records: {0}")]
     EncodingError(String),
+    /// The broker returned a malformed response.
+    #[error("broker returned a malformed response")]
+    MalformedResponse,
     /// The specified topic has no available partitions.
     #[error("the specified topic has no available partitions: {0}")]
     NoPartitionsAvailable(String),
+    /// Produce requests must include at least 1 record.
+    #[error("produce requests must include at least 1 record")]
+    ProducerMessagesEmpty,
     /// The specified topic is unknown to the cluster.
     #[error("the specified topic is unknown to the cluster: {0}")]
     UnknownTopic(String),
