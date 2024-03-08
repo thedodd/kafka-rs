@@ -5,16 +5,21 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use kafka_protocol::{
     indexmap::IndexMap,
-    messages::{produce_request::PartitionProduceData, ProduceRequest, ResponseKind},
+    messages::{
+        fetch_request::{FetchPartition, FetchTopic},
+        list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
+        produce_request::PartitionProduceData,
+        FetchRequest, ListOffsetsRequest, ProduceRequest, ResponseKind,
+    },
     protocol::StrBytes,
-    records::{Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType},
+    records::{Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions, TimestampType},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
-use crate::broker::BrokerResponse;
 use crate::clitask::{ClientTask, ClusterMeta, Msg};
 use crate::error::ClientError;
+use crate::{broker::BrokerResponse, error::ClientResult};
 
 /*
 - TODO: build a TopicBatcher on top of a TopicProducer which works like a sink,
@@ -24,8 +29,6 @@ use crate::error::ClientError;
 /// The default timeout used for requests (10s).
 pub const DEFAULT_TIMEOUT: i32 = 10 * 1000;
 
-/// Client results from interaction with a Kafka cluster.
-pub type Result<T> = std::result::Result<T, ClientError>;
 /// Headers of a message.
 pub type MessageHeaders = IndexMap<StrBytes, Option<Bytes>>;
 
@@ -63,6 +66,127 @@ impl Client {
             cluster: topics,
             _shutdown: Arc::new(shutdown.drop_guard()),
         }
+    }
+
+    /// List topic partition offsets.
+    pub async fn list_offsets(&self, topic: StrBytes, ptn: i32, pos: ListOffsetsPosition) -> ClientResult<i64> {
+        let mut cluster = self.cluster.load();
+        if !*cluster.bootstrap.borrow() {
+            let mut sig = cluster.bootstrap.clone();
+            let _ = sig.wait_for(|val| *val).await; // Ensure the cluster metadata is bootstrapped.
+            cluster = self.cluster.load();
+        }
+
+        // Get the broker responsible for the target topic/partition.
+        let topic_ptns = cluster.topics.get(&topic).ok_or(ClientError::UnknownTopic(topic.to_string()))?;
+        let broker = topic_ptns.get(&ptn).ok_or(ClientError::UnknownPartition(topic.to_string(), ptn))?;
+
+        // Build request.
+        let uid = uuid::Uuid::new_v4();
+        let mut req = ListOffsetsRequest::default();
+        // req.isolation_level = 0; // TODO: update this.
+        let mut req_topic = ListOffsetsTopic::default();
+        req_topic.name = topic.clone().into();
+        let mut req_ptn = ListOffsetsPartition::default();
+        req_ptn.partition_index = ptn;
+        req_ptn.timestamp = match pos {
+            ListOffsetsPosition::Earliest => -2,
+            ListOffsetsPosition::Latest => -1,
+            ListOffsetsPosition::Timestamp(val) => val,
+        };
+        req_topic.partitions.push(req_ptn);
+        req.topics.push(req_topic);
+
+        // Send request.
+        let (tx, rx) = oneshot::channel();
+        broker.conn.list_offsets(uid, req, tx).await;
+        let res = rx.await;
+
+        // Unpack response & handle errors.
+        // TODO: check for error codes in response.
+        let offset = res
+            .map_err(|_| ClientError::Other("response channel dropped by broker, which should never happen".into()))?
+            .result
+            .map_err(ClientError::BrokerError)
+            .and_then(|(_, res)| {
+                if let ResponseKind::ListOffsetsResponse(res) = res {
+                    Ok(res)
+                } else {
+                    Err(ClientError::MalformedResponse)
+                }
+            })
+            .and_then(|res| {
+                res.topics
+                    .iter()
+                    .find(|topic_res| topic_res.name.0 == topic)
+                    .and_then(|topic_res| topic_res.partitions.iter().find(|ptn_res| ptn_res.partition_index == ptn).map(|ptn_res| ptn_res.offset))
+                    .ok_or(ClientError::MalformedResponse)
+            })?;
+
+        Ok(offset)
+    }
+
+    /// Fetch a batch of records from the target topic partition.
+    pub async fn fetch(&self, topic: StrBytes, ptn: i32, start: i64) -> ClientResult<Option<Vec<Record>>> {
+        let mut cluster = self.cluster.load();
+        if !*cluster.bootstrap.borrow() {
+            let mut sig = cluster.bootstrap.clone();
+            let _ = sig.wait_for(|val| *val).await; // Ensure the cluster metadata is bootstrapped.
+            cluster = self.cluster.load();
+        }
+
+        // Get the broker responsible for the target topic/partition.
+        let topic_ptns = cluster.topics.get(&topic).ok_or(ClientError::UnknownTopic(topic.to_string()))?;
+        let broker = topic_ptns.get(&ptn).ok_or(ClientError::UnknownPartition(topic.to_string(), ptn))?;
+
+        // Build request.
+        let uid = uuid::Uuid::new_v4();
+        let mut req = FetchRequest::default();
+        req.max_bytes = 1024i32.pow(2);
+        req.max_wait_ms = 10_000;
+        // req.isolation_level = 0; // TODO: update this.
+        let mut req_topic = FetchTopic::default();
+        req_topic.topic = topic.clone().into();
+        let mut req_ptn = FetchPartition::default();
+        req_ptn.partition = ptn;
+        req_ptn.partition_max_bytes = 1024i32.pow(2);
+        req_ptn.fetch_offset = start;
+        req_topic.partitions.push(req_ptn);
+        req.topics.push(req_topic);
+        tracing::debug!("about to send request: {:?}", req);
+
+        // Send request.
+        let (tx, rx) = oneshot::channel();
+        broker.conn.fetch(uid, req, tx).await;
+        let res = rx.await;
+
+        // Unpack response & handle errors.
+        // TODO: check for error codes in response.
+        let batch_opt = res
+            .map_err(|_| ClientError::Other("response channel dropped by broker, which should never happen".into()))?
+            .result
+            .map_err(ClientError::BrokerError)
+            .and_then(|(_, res)| {
+                tracing::debug!("res: {:?}", res);
+                if let ResponseKind::FetchResponse(res) = res {
+                    Ok(res)
+                } else {
+                    Err(ClientError::MalformedResponse)
+                }
+            })
+            .and_then(|res| {
+                res.responses
+                    .iter()
+                    .find(|topic_res| topic_res.topic.0 == topic)
+                    .and_then(|topic_res| topic_res.partitions.iter().find(|ptn_res| ptn_res.partition_index == ptn).map(|ptn_res| ptn_res.records.clone()))
+                    .ok_or(ClientError::MalformedResponse)
+            })?;
+
+        // If some data was returned, then decode the batch.
+        let Some(mut batch) = batch_opt else { return Ok(None) };
+        let records = RecordBatchDecoder::decode(&mut batch).map_err(|_| ClientError::MalformedResponse)?;
+
+        Ok(Some(records))
     }
 
     /// Build a producer for a topic.
@@ -146,7 +270,7 @@ pub struct TopicProducer {
 
 impl TopicProducer {
     /// Produce a batch of records to the specified topic.
-    pub async fn produce(&mut self, messages: &[Message]) -> Result<(i64, i64)> {
+    pub async fn produce(&mut self, messages: &[Message]) -> ClientResult<(i64, i64)> {
         // TODO: allow for producer to specify partition instead of using sticky rotating partitions.
 
         // Check for topic metadata.
@@ -237,6 +361,7 @@ impl TopicProducer {
         };
 
         // Handle response.
+        // TODO: check for error codes in response.
         res.result
             .map_err(ClientError::BrokerError)
             .and_then(|res| {
@@ -257,4 +382,14 @@ impl TopicProducer {
                     .ok_or(ClientError::MalformedResponse)
             })
     }
+}
+
+/// The position in a log to fetch an offset for.
+pub enum ListOffsetsPosition {
+    /// Fetch the offset of the beginning of the partition's log.
+    Earliest,
+    /// Fetch the next offset after the last offset of the partition's log.
+    Latest,
+    /// Fetch the offset for the corresponding timestamp.
+    Timestamp(i64),
 }

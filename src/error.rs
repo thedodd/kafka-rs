@@ -2,6 +2,9 @@
 
 use kafka_protocol::messages::RequestKind;
 
+/// Client results from interaction with a Kafka cluster.
+pub type ClientResult<T> = std::result::Result<T, ClientError>;
+
 /// Client errors from interacting with a Kafka cluster.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -23,6 +26,11 @@ pub enum ClientError {
     /// The specified topic is unknown to the cluster.
     #[error("the specified topic is unknown to the cluster: {0}")]
     UnknownTopic(String),
+    /// The specified topic partition is unknown to the cluster.
+    #[error("the specified topic partition is unknown to the cluster: {0}/{1}")]
+    UnknownPartition(String, i32),
+    #[error("{0}")]
+    Other(String),
 }
 
 /// Broker connection level error.
