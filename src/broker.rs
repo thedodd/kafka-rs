@@ -5,10 +5,12 @@ use std::{collections::BTreeMap, time::Duration};
 
 use anyhow::{Context, Result};
 use futures::prelude::*;
+use kafka_protocol::messages::{FetchRequest, ListOffsetsRequest};
 use kafka_protocol::{
     messages::{metadata_response::MetadataResponseBroker, ApiKey, ApiVersionsRequest, MetadataRequest, ProduceRequest, RequestHeader, RequestKind, ResponseHeader, ResponseKind},
     protocol::{Decodable, Message, Request as RequestProto, VersionRange},
 };
+use tokio::sync::oneshot;
 use tokio::{net::TcpStream, sync::mpsc, time::timeout};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
@@ -21,8 +23,6 @@ use crate::error::{BrokerErrorKind, BrokerRequestError};
 
 /// A result from a broker interaction.
 pub(crate) type BrokerResult<T> = Result<T, BrokerRequestError>;
-/// The channel type used for getting responses from a broker connection.
-pub(crate) type MsgTx = mpsc::UnboundedSender<BrokerResponse>;
 
 /// A response from a broker along with the UUID of the original request.
 ///
@@ -38,6 +38,8 @@ pub(crate) struct BrokerResponse {
 pub(crate) enum Msg {
     GetMetadata(uuid::Uuid, MsgTx),
     Produce(uuid::Uuid, ProduceRequest, MsgTx),
+    Fetch(uuid::Uuid, FetchRequest, ResponseChannel),
+    ListOffsets(uuid::Uuid, ListOffsetsRequest, ResponseChannel),
 }
 
 /// A handle to a broker connection.
@@ -62,6 +64,8 @@ impl Broker {
         })
     }
 
+    // TODO: these methods are an unnecessary abstraction. Have crate-internal client code just use chan+Msg directly.
+
     /// Get the cluster's metadata according to this broker (should be uniform across all brokers).
     pub(crate) async fn get_metadata(&self, id: uuid::Uuid, tx: MsgTx) {
         let _ = self.chan.send(Msg::GetMetadata(id, tx)).await; // Unreachable error case.
@@ -71,7 +75,17 @@ impl Broker {
     ///
     /// If the request fails, the original request payload is returned.
     pub(crate) async fn produce(&self, id: uuid::Uuid, req: ProduceRequest, tx: MsgTx) {
-        let _ = self.chan.send(Msg::Produce(id, req.clone(), tx)).await; // Unreachable error case.
+        let _ = self.chan.send(Msg::Produce(id, req, tx)).await; // Unreachable error case.
+    }
+
+    /// Submit a list offsets request to the broker.
+    pub(crate) async fn list_offsets<T: Into<ResponseChannel>>(&self, id: uuid::Uuid, req: ListOffsetsRequest, tx: T) {
+        let _ = self.chan.send(Msg::ListOffsets(id, req, tx.into())).await; // Unreachable error case.
+    }
+
+    /// Submit a fetch request to the broker.
+    pub(crate) async fn fetch<T: Into<ResponseChannel>>(&self, id: uuid::Uuid, req: FetchRequest, tx: T) {
+        let _ = self.chan.send(Msg::Fetch(id, req, tx.into())).await; // Unreachable error case.
     }
 }
 
@@ -141,18 +155,20 @@ impl BrokerTask {
             // Msg::GetApiVersions(tx) => self.handle_get_api_versions(Some(tx)).await,
             Msg::GetMetadata(id, tx) => self.get_metadata(writer, id, Some(tx)).await,
             Msg::Produce(id, req, tx) => self.produce(writer, id, req, Some(tx)).await,
+            Msg::Fetch(id, req, tx) => self.fetch(writer, id, req, Some(tx)).await,
+            Msg::ListOffsets(id, req, tx) => self.list_offsets(writer, id, req, Some(tx)).await,
         }
     }
 
     /// Write the request to the broker, and queue for response.
     async fn write(&mut self, writer: &mut KafkaWriter, cid: i32, req: OutboundRequest) -> Result<()> {
         if let Err(err) = writer.send(&req.request).await.context("error sending request to broker") {
-            if let Some(chan) = req.chan.as_ref() {
+            if let Some(chan) = req.chan {
                 let req_err = BrokerRequestError {
                     payload: req.request.kind,
                     kind: BrokerErrorKind::Disconnected,
                 };
-                let _ = chan.send(BrokerResponse { id: req.id, result: Err(req_err) });
+                chan.send(BrokerResponse { id: req.id, result: Err(req_err) });
             }
             return Err(err);
         }
@@ -161,9 +177,6 @@ impl BrokerTask {
         Ok(())
     }
 
-    /// Fetch API versions info from this broker.
-    ///
-    /// This call should only err if the underlying connection has disconnected.
     async fn get_api_versions(&mut self, writer: &mut KafkaWriter, chan: Option<MsgTx>) -> Result<()> {
         let correlation_id = self.next_correlation_id;
         self.next_correlation_id = self.next_correlation_id.wrapping_add(1);
@@ -186,7 +199,7 @@ impl BrokerTask {
             },
             api_version: supported_versions.max,
             api_key,
-            chan,
+            chan: chan.map(Into::into),
         };
         self.write(writer, correlation_id, req).await
     }
@@ -213,7 +226,7 @@ impl BrokerTask {
             },
             api_version: supported_versions.max,
             api_key,
-            chan,
+            chan: chan.map(Into::into),
         };
         self.write(writer, correlation_id, req).await
     }
@@ -240,6 +253,60 @@ impl BrokerTask {
             },
             api_version: supported_versions.max,
             api_key,
+            chan: chan.map(Into::into),
+        };
+        self.write(writer, correlation_id, req).await
+    }
+
+    async fn fetch(&mut self, writer: &mut KafkaWriter, id: uuid::Uuid, req: FetchRequest, chan: Option<ResponseChannel>) -> Result<()> {
+        let correlation_id = self.next_correlation_id;
+        self.next_correlation_id = self.next_correlation_id.wrapping_add(1);
+
+        let (min, max) = self.api_versions.get(&FetchRequest::KEY).copied().unwrap_or((0, 0));
+        let supported_versions = FetchRequest::VERSIONS.intersect(&VersionRange { min, max });
+        tracing::debug!(?supported_versions, correlation_id, "sending fetch request");
+
+        let api_key = ApiKey::FetchKey;
+        let mut header = RequestHeader::default();
+        header.request_api_key = api_key as i16;
+        header.request_api_version = supported_versions.max;
+        header.correlation_id = correlation_id;
+
+        let req = OutboundRequest {
+            id,
+            request: Request {
+                header,
+                kind: RequestKind::FetchRequest(req),
+            },
+            api_version: supported_versions.max,
+            api_key,
+            chan,
+        };
+        self.write(writer, correlation_id, req).await
+    }
+
+    async fn list_offsets(&mut self, writer: &mut KafkaWriter, id: uuid::Uuid, req: ListOffsetsRequest, chan: Option<ResponseChannel>) -> Result<()> {
+        let correlation_id = self.next_correlation_id;
+        self.next_correlation_id = self.next_correlation_id.wrapping_add(1);
+
+        let (min, max) = self.api_versions.get(&ListOffsetsRequest::KEY).copied().unwrap_or((0, 0));
+        let supported_versions = ListOffsetsRequest::VERSIONS.intersect(&VersionRange { min, max });
+        tracing::debug!(?supported_versions, correlation_id, "sending list offsets request");
+
+        let api_key = ApiKey::ListOffsetsKey;
+        let mut header = RequestHeader::default();
+        header.request_api_key = api_key as i16;
+        header.request_api_version = supported_versions.max;
+        header.correlation_id = correlation_id;
+
+        let req = OutboundRequest {
+            id,
+            request: Request {
+                header,
+                kind: RequestKind::ListOffsetsRequest(req),
+            },
+            api_version: supported_versions.max,
+            api_key,
             chan,
         };
         self.write(writer, correlation_id, req).await
@@ -253,7 +320,7 @@ impl BrokerTask {
         let header_version = pending.api_key.response_header_version(pending.api_version);
         let Ok(response_header) = ResponseHeader::decode(&mut resp.body, header_version) else {
             if let Some(chan) = pending.chan {
-                let _ = chan.send(BrokerResponse {
+                chan.send(BrokerResponse {
                     id: pending.id,
                     result: Err(BrokerRequestError {
                         payload: pending.request.kind,
@@ -338,7 +405,7 @@ impl BrokerTask {
         };
         let Ok(response_body) = res else {
             if let Some(chan) = pending.chan {
-                let _ = chan.send(BrokerResponse {
+                chan.send(BrokerResponse {
                     id: pending.id,
                     result: Err(BrokerRequestError {
                         payload: pending.request.kind,
@@ -361,7 +428,7 @@ impl BrokerTask {
         }
 
         if let Some(chan) = pending.chan {
-            let _ = chan.send(BrokerResponse {
+            chan.send(BrokerResponse {
                 id: pending.id,
                 result: Ok((response_header, response_body)),
             });
@@ -421,7 +488,7 @@ impl BrokerConnecting {
     async fn drain_pending_requests(&mut self) {
         while let Some((_, req)) = self.inner.requests.pop_first() {
             if let Some(chan) = req.chan {
-                let _ = chan.send(BrokerResponse {
+                chan.send(BrokerResponse {
                     id: req.id,
                     result: Err(BrokerRequestError {
                         payload: req.request.kind,
@@ -528,7 +595,7 @@ struct OutboundRequest {
     /// The API version of the corresponding request.
     api_version: i16,
     /// The channel used to send the finalized response.
-    chan: Option<MsgTx>,
+    chan: Option<ResponseChannel>,
 }
 
 /// Metadata on a broker, used for establishing connections.
@@ -557,5 +624,39 @@ impl From<String> for BrokerConnInfo {
 impl From<MetadataResponseBroker> for BrokerConnInfo {
     fn from(value: MetadataResponseBroker) -> Self {
         Self::Meta(value)
+    }
+}
+
+/// The channel type used for getting responses from a broker connection.
+pub(crate) type MsgTx = mpsc::UnboundedSender<BrokerResponse>;
+
+/// The response channel type used by a request.
+pub(crate) enum ResponseChannel {
+    UnboundedMpsc(MsgTx),
+    Oneshot(oneshot::Sender<BrokerResponse>),
+}
+
+impl ResponseChannel {
+    pub(crate) fn send(self, res: BrokerResponse) {
+        match self {
+            Self::UnboundedMpsc(chan) => {
+                let _ = chan.send(res);
+            }
+            Self::Oneshot(chan) => {
+                let _ = chan.send(res);
+            }
+        }
+    }
+}
+
+impl From<oneshot::Sender<BrokerResponse>> for ResponseChannel {
+    fn from(src: oneshot::Sender<BrokerResponse>) -> Self {
+        Self::Oneshot(src)
+    }
+}
+
+impl From<MsgTx> for ResponseChannel {
+    fn from(src: MsgTx) -> Self {
+        Self::UnboundedMpsc(src)
     }
 }
