@@ -252,7 +252,7 @@ pub struct TopicProducer {
     /// NOTE WELL: this value should never be updated outside of the `ClientTask`.
     cluster: ClusterMeta,
     /// The topic being produced to.
-    topic: StrBytes,
+    pub topic: StrBytes,
     /// Acks level to use for produce requests.
     acks: Acks,
     /// Timeout for produce requests.
@@ -378,7 +378,13 @@ impl TopicProducer {
                 res.responses
                     .iter()
                     .find(|topic| topic.0 .0 == self.topic)
-                    .and_then(|val| val.1.partition_responses.first().map(|val| (val.base_offset, val.base_offset + messages.len() as i64)))
+                    .and_then(|val| {
+                        val.1.partition_responses.first().map(|val| {
+                            debug_assert!(messages.len() > 0, "messages len should always be validated at start of function");
+                            let last_offset = val.base_offset + (messages.len() - 1) as i64;
+                            (val.base_offset, last_offset)
+                        })
+                    })
                     .ok_or(ClientError::MalformedResponse)
             })
     }
