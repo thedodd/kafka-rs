@@ -380,7 +380,7 @@ impl TopicProducer {
                     .find(|topic| topic.0 .0 == self.topic)
                     .and_then(|val| {
                         val.1.partition_responses.first().map(|val| {
-                            debug_assert!(messages.len() > 0, "messages len should always be validated at start of function");
+                            debug_assert!(!messages.is_empty(), "messages len should always be validated at start of function");
                             let last_offset = val.base_offset + (messages.len() - 1) as i64;
                             (val.base_offset, last_offset)
                         })

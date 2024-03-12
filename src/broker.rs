@@ -481,7 +481,7 @@ impl BrokerConnecting {
         }
 
         // Wrap TCP stream in framed codecs.
-        Ok(codec::new_kafka_transport(conn, None))
+        Ok(codec::new_kafka_transport(conn, None)) // Defaults to 16Mi max payload size.
     }
 
     /// Drain any pending requests upon reconnect.
