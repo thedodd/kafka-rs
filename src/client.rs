@@ -300,7 +300,7 @@ impl TopicProducer {
         self.last_ptn = sticky_ptn;
 
         // Transform the given messages into their record form.
-        let timestamp = chrono::Utc::now().timestamp();
+        let timestamp = chrono::Utc::now().timestamp_millis();
         for msg in messages.iter() {
             self.batch_buf.push(Record {
                 transactional: false,
