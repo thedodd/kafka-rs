@@ -9,7 +9,7 @@ use kafka_protocol::{
         fetch_request::{FetchPartition, FetchTopic},
         list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
         produce_request::PartitionProduceData,
-        FetchRequest, ListOffsetsRequest, ProduceRequest, ResponseKind,
+        FetchRequest, ListOffsetsRequest, MetadataResponse, ProduceRequest, ResponseHeader, ResponseKind,
     },
     protocol::StrBytes,
     records::{Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions, TimestampType},
@@ -58,7 +58,7 @@ impl Client {
     pub fn new(seed_list: Vec<String>) -> Self {
         let (tx, rx) = mpsc::channel(1_000);
         let shutdown = CancellationToken::new();
-        let task = ClientTask::new(seed_list, rx, shutdown.clone());
+        let task = ClientTask::new(seed_list, None, rx, false, shutdown.clone());
         let topics = task.cluster.clone();
         tokio::spawn(task.run());
         Self {
@@ -66,6 +66,57 @@ impl Client {
             cluster: topics,
             _shutdown: Arc::new(shutdown.drop_guard()),
         }
+    }
+
+    /// Construct a new instance from a seed list and a block list.
+    ///
+    /// - `seed_list`: URLs of the initial brokers to attempt to connect to in order to gather
+    ///   cluster metadata. The metadata will be used to establish connections to all other brokers.
+    /// - `block_list`: an optional set of broker IDs for which connections should not be established.
+    ///   This is typically not needed. This only applies after cluster metadata has been gathered.
+    #[cfg(feature = "internal")]
+    pub fn new_internal(seed_list: Vec<String>, block_list: Vec<i32>) -> Self {
+        let (tx, rx) = mpsc::channel(1_000);
+        let shutdown = CancellationToken::new();
+        let task = ClientTask::new(seed_list, Some(block_list), rx, true, shutdown.clone());
+        let topics = task.cluster.clone();
+        tokio::spawn(task.run());
+        Self {
+            _tx: tx,
+            cluster: topics,
+            _shutdown: Arc::new(shutdown.drop_guard()),
+        }
+    }
+
+    /// Get cluster metadata from the broker specified by ID.
+    pub async fn get_metadata(&self, broker_id: i32) -> ClientResult<MetadataResponse> {
+        let mut cluster = self.cluster.load();
+        if !*cluster.bootstrap.borrow() {
+            let mut sig = cluster.bootstrap.clone();
+            let _ = sig.wait_for(|val| *val).await; // Ensure the cluster metadata is bootstrapped.
+            cluster = self.cluster.load();
+        }
+
+        let broker = cluster
+            .brokers
+            .get(&broker_id)
+            .ok_or(ClientError::Other("broker does not exist in currently discovered metadata".into()))?;
+
+        // Send request.
+        let uid = uuid::Uuid::new_v4();
+        let (tx, rx) = oneshot::channel();
+        broker.conn.get_metadata(uid, tx.into(), true).await;
+
+        // Await response.
+        let res = unpack_broker_response(rx).await.and_then(|(_, res)| {
+            if let ResponseKind::MetadataResponse(res) = res {
+                Ok(res)
+            } else {
+                Err(ClientError::MalformedResponse)
+            }
+        })?;
+
+        Ok(res)
     }
 
     /// List topic partition offsets.
@@ -100,14 +151,11 @@ impl Client {
         // Send request.
         let (tx, rx) = oneshot::channel();
         broker.conn.list_offsets(uid, req, tx).await;
-        let res = rx.await;
 
         // Unpack response & handle errors.
         // TODO: check for error codes in response.
-        let offset = res
-            .map_err(|_| ClientError::Other("response channel dropped by broker, which should never happen".into()))?
-            .result
-            .map_err(ClientError::BrokerError)
+        let offset = unpack_broker_response(rx)
+            .await
             .and_then(|(_, res)| {
                 if let ResponseKind::ListOffsetsResponse(res) = res {
                     Ok(res)
@@ -158,14 +206,11 @@ impl Client {
         // Send request.
         let (tx, rx) = oneshot::channel();
         broker.conn.fetch(uid, req, tx).await;
-        let res = rx.await;
 
         // Unpack response & handle errors.
         // TODO: check for error codes in response.
-        let batch_opt = res
-            .map_err(|_| ClientError::Other("response channel dropped by broker, which should never happen".into()))?
-            .result
-            .map_err(ClientError::BrokerError)
+        let batch_opt = unpack_broker_response(rx)
+            .await
             .and_then(|(_, res)| {
                 tracing::debug!("res: {:?}", res);
                 if let ResponseKind::FetchResponse(res) = res {
@@ -318,22 +363,7 @@ impl TopicProducer {
             });
         }
 
-        // Encode the records into a request.
-        // TODO: until https://github.com/tychedelia/kafka-protocol-rs/issues/55 is g2g, we overestimate a bit.
-        let size = self.batch_buf.iter().fold(0usize, |mut acc, record| {
-            acc += 21; // Max size of the varint encoded values in a v2 record.
-            if let Some(key) = record.key.as_ref() {
-                acc += key.len();
-            }
-            if let Some(val) = record.value.as_ref() {
-                acc += val.len();
-            }
-            for (k, v) in record.headers.iter() {
-                acc += 4 + k.len() + 4 + v.as_ref().map(|v| v.len()).unwrap_or(0);
-            }
-            acc
-        });
-        self.buf.reserve(size);
+        // Encode the records into a request. Note that BytesMut will allocate more space whenever needed.
         let res = RecordBatchEncoder::encode(&mut self.buf, self.batch_buf.iter(), &self.encode_opts).map_err(|err| ClientError::EncodingError(format!("{:?}", err)));
         self.batch_buf.clear();
         res?;
@@ -398,4 +428,12 @@ pub enum ListOffsetsPosition {
     Latest,
     /// Fetch the offset for the corresponding timestamp.
     Timestamp(i64),
+}
+
+/// Await and unpack a broker response.
+async fn unpack_broker_response(rx: oneshot::Receiver<BrokerResponse>) -> ClientResult<(ResponseHeader, ResponseKind)> {
+    rx.await
+        .map_err(|_| ClientError::Other("response channel dropped by broker, which should never happen".into()))?
+        .result
+        .map_err(ClientError::BrokerError)
 }

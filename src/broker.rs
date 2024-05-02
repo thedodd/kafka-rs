@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::{collections::BTreeMap, time::Duration};
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use futures::prelude::*;
 use kafka_protocol::messages::{FetchRequest, ListOffsetsRequest};
 use kafka_protocol::{
@@ -36,7 +37,7 @@ pub(crate) struct BrokerResponse {
 }
 
 pub(crate) enum Msg {
-    GetMetadata(uuid::Uuid, MsgTx),
+    GetMetadata(uuid::Uuid, ResponseChannel, bool),
     Produce(uuid::Uuid, ProduceRequest, MsgTx),
     Fetch(uuid::Uuid, FetchRequest, ResponseChannel),
     ListOffsets(uuid::Uuid, ListOffsetsRequest, ResponseChannel),
@@ -67,8 +68,8 @@ impl Broker {
     // TODO: these methods are an unnecessary abstraction. Have crate-internal client code just use chan+Msg directly.
 
     /// Get the cluster's metadata according to this broker (should be uniform across all brokers).
-    pub(crate) async fn get_metadata(&self, id: uuid::Uuid, tx: MsgTx) {
-        let _ = self.chan.send(Msg::GetMetadata(id, tx)).await; // Unreachable error case.
+    pub(crate) async fn get_metadata(&self, id: uuid::Uuid, tx: ResponseChannel, internal: bool) {
+        let _ = self.chan.send(Msg::GetMetadata(id, tx, internal)).await; // Unreachable error case.
     }
 
     /// Produce data to the broker.
@@ -153,7 +154,7 @@ impl BrokerTask {
     async fn handle_msg(&mut self, writer: &mut KafkaWriter, msg: Msg) -> Result<()> {
         match msg {
             // Msg::GetApiVersions(tx) => self.handle_get_api_versions(Some(tx)).await,
-            Msg::GetMetadata(id, tx) => self.get_metadata(writer, id, Some(tx)).await,
+            Msg::GetMetadata(id, tx, internal) => self.get_metadata(writer, id, Some(tx), internal).await,
             Msg::Produce(id, req, tx) => self.produce(writer, id, req, Some(tx)).await,
             Msg::Fetch(id, req, tx) => self.fetch(writer, id, req, Some(tx)).await,
             Msg::ListOffsets(id, req, tx) => self.list_offsets(writer, id, req, Some(tx)).await,
@@ -204,7 +205,7 @@ impl BrokerTask {
         self.write(writer, correlation_id, req).await
     }
 
-    async fn get_metadata(&mut self, writer: &mut KafkaWriter, id: uuid::Uuid, chan: Option<MsgTx>) -> Result<()> {
+    async fn get_metadata(&mut self, writer: &mut KafkaWriter, id: uuid::Uuid, chan: Option<ResponseChannel>, internal: bool) -> Result<()> {
         let correlation_id = self.next_correlation_id;
         self.next_correlation_id = self.next_correlation_id.wrapping_add(1);
 
@@ -218,11 +219,16 @@ impl BrokerTask {
         header.request_api_version = supported_versions.max;
         header.correlation_id = correlation_id;
 
+        let mut body = MetadataRequest::default();
+        if internal {
+            // If internal, then pass along the internal tag buffer in the request.
+            body.unknown_tagged_fields.insert(0, Bytes::new());
+        }
         let req = OutboundRequest {
             id,
             request: Request {
                 header,
-                kind: RequestKind::MetadataRequest(MetadataRequest::default()),
+                kind: RequestKind::MetadataRequest(body),
             },
             api_version: supported_versions.max,
             api_key,
@@ -402,6 +408,12 @@ impl BrokerTask {
             ApiKey::DescribeTransactionsKey => DescribeTransactionsResponse::decode(&mut resp.body, pending.api_version).map(ResponseKind::DescribeTransactionsResponse),
             ApiKey::ListTransactionsKey => ListTransactionsResponse::decode(&mut resp.body, pending.api_version).map(ResponseKind::ListTransactionsResponse),
             ApiKey::AllocateProducerIdsKey => AllocateProducerIdsResponse::decode(&mut resp.body, pending.api_version).map(ResponseKind::AllocateProducerIdsResponse),
+            ApiKey::ConsumerGroupHeartbeatKey => ConsumerGroupHeartbeatResponse::decode(&mut resp.body, pending.api_version).map(ResponseKind::ConsumerGroupHeartbeatResponse),
+            ApiKey::ControllerRegistrationKey => ControllerRegistrationResponse::decode(&mut resp.body, pending.api_version).map(ResponseKind::ControllerRegistrationResponse),
+            ApiKey::GetTelemetrySubscriptionsKey => GetTelemetrySubscriptionsResponse::decode(&mut resp.body, pending.api_version).map(ResponseKind::GetTelemetrySubscriptionsResponse),
+            ApiKey::PushTelemetryKey => PushTelemetryResponse::decode(&mut resp.body, pending.api_version).map(ResponseKind::PushTelemetryResponse),
+            ApiKey::AssignReplicasToDirsKey => AssignReplicasToDirsResponse::decode(&mut resp.body, pending.api_version).map(ResponseKind::AssignReplicasToDirsResponse),
+            ApiKey::ListClientMetricsResourcesKey => ListClientMetricsResourcesResponse::decode(&mut resp.body, pending.api_version).map(ResponseKind::ListClientMetricsResourcesResponse),
         };
         let Ok(response_body) = res else {
             if let Some(chan) = pending.chan {

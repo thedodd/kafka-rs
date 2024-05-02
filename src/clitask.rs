@@ -74,6 +74,10 @@ pub(crate) struct ClientTask {
     /// After the first set of metadata responses are returned, the brokers described in
     /// the returned metadata will be used for all following client connections.
     seed_list: Vec<String>,
+    /// An optional set of broker IDs for which connections should not be established.
+    ///
+    /// This is typically not needed. This only applies after cluster metadata has been gathered.
+    block_list: Option<Vec<i32>>,
     /// The channel used for receiving client interaction requests.
     rx: mpsc::Receiver<Msg>,
     /// The channel used for receiving responses from brokers.
@@ -82,6 +86,8 @@ pub(crate) struct ClientTask {
     resp_rx: mpsc::UnboundedReceiver<BrokerResponse>,
     /// Cluster metadata bootstrap signal.
     bootstrap_tx: watch::Sender<bool>,
+    /// Indicator if this client is running internally within a cluster.
+    internal: bool,
     /// Client shutdown signal.
     shutdown: CancellationToken,
 
@@ -93,16 +99,18 @@ pub(crate) struct ClientTask {
 
 impl ClientTask {
     /// Construct a new instance.
-    pub(crate) fn new(seed_list: Vec<String>, rx: mpsc::Receiver<Msg>, shutdown: CancellationToken) -> Self {
+    pub(crate) fn new(seed_list: Vec<String>, block_list: Option<Vec<i32>>, rx: mpsc::Receiver<Msg>, internal: bool, shutdown: CancellationToken) -> Self {
         let (bootstrap_tx, bootstrap_rx) = watch::channel(false);
         let (resp_tx, resp_rx) = mpsc::unbounded_channel();
         Self {
             seed_list,
+            block_list,
             rx,
             resp_tx,
             resp_rx,
             cluster: Arc::new(ArcSwap::new(Arc::new(Cluster::new(bootstrap_rx.clone())))),
             bootstrap_tx,
+            internal,
             shutdown,
         }
     }
@@ -141,7 +149,7 @@ impl ClientTask {
                 // Now, just fetch cluster metadata info.
                 let conn = Broker::new(BrokerConnInfo::Host(host));
                 let uid = uuid::Uuid::new_v4();
-                conn.get_metadata(uid, self.resp_tx.clone()).await;
+                conn.get_metadata(uid, self.resp_tx.clone().into(), self.internal).await;
 
                 // Await response from broker.
                 let res = loop {
@@ -190,7 +198,8 @@ impl ClientTask {
         for (id, meta) in meta.brokers {
             let broker_opt = cluster.brokers.get(&id);
             let needs_update = broker_opt.map(|_meta| _meta.meta != meta).unwrap_or(true);
-            if needs_update {
+            let in_block_list = self.block_list.as_ref().map(|list| list.contains(&id)).unwrap_or(false);
+            if needs_update && !in_block_list {
                 let conn = Broker::new(meta.clone());
                 cluster.brokers.insert(id, Arc::new(BrokerMeta { id, conn, meta }));
             }
