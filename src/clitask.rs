@@ -31,6 +31,9 @@ pub(crate) struct Cluster {
     pub(crate) brokers: BTreeMap<BrokerId, BrokerMetaPtr>,
     /// All topics which have been discovered from cluster metadata queries.
     pub(crate) topics: BTreeMap<StrBytes, BTreeMap<i32, PartitionMetadata>>,
+    // pub(crate) topics: BTreeMap<StrBytes, BTreeMap<i32, BrokerMetaPtr>>,
+    /// Broker responsible for updating cluster metadata.
+    pub(crate) controller: Option<BrokerMetaPtr>,
 }
 
 impl Cluster {
@@ -40,6 +43,7 @@ impl Cluster {
             bootstrap,
             brokers: Default::default(),
             topics: Default::default(),
+            controller: Default::default(),
         }
     }
 }
@@ -176,7 +180,7 @@ impl ClientTask {
                 // Await response from broker.
                 let res = loop {
                     let Some(res) = self.resp_rx.recv().await else {
-                        unreachable!("both ends of channel are heald, receiving None should not be possible")
+                        unreachable!("both ends of channel are held, receiving None should not be possible")
                     };
                     if res.id == uid {
                         break res;
@@ -213,6 +217,7 @@ impl ClientTask {
     fn update_cluster_metadata(&mut self, meta: MetadataResponse) {
         let mut cluster_ptr = self.cluster.load_full();
         let cluster = Arc::make_mut(&mut cluster_ptr);
+        let controller_id = meta.controller_id;
 
         // Establish connections to any new brokers.
         cluster.brokers.retain(|id, _| meta.brokers.contains_key(id)); // Remove brokers which no longer exist.
@@ -223,6 +228,9 @@ impl ClientTask {
             if needs_update && !in_block_list {
                 let conn = Broker::new(meta.clone());
                 cluster.brokers.insert(id, Arc::new(BrokerMeta { id, conn, meta }));
+            }
+            if id == controller_id {
+                cluster.controller = cluster.brokers.get(&id).cloned();
             }
         }
 

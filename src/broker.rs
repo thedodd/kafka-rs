@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, time::Duration};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::prelude::*;
-use kafka_protocol::messages::{FetchRequest, FindCoordinatorRequest, ListOffsetsRequest};
+use kafka_protocol::messages::{CreateTopicsRequest, DeleteTopicsRequest, FetchRequest, FindCoordinatorRequest, ListOffsetsRequest};
 use kafka_protocol::{
     messages::{metadata_response::MetadataResponseBroker, ApiKey, ApiVersionsRequest, MetadataRequest, ProduceRequest, RequestHeader, RequestKind, ResponseHeader, ResponseKind},
     protocol::{Decodable, Message, Request as RequestProto, VersionRange},
@@ -42,6 +42,8 @@ pub(crate) enum Msg {
     Fetch(uuid::Uuid, FetchRequest, ResponseChannel),
     FindCoordinator(uuid::Uuid, FindCoordinatorRequest, ResponseChannel),
     ListOffsets(uuid::Uuid, ListOffsetsRequest, ResponseChannel),
+    CreateTopics(uuid::Uuid, CreateTopicsRequest, ResponseChannel),
+    DeleteTopics(uuid::Uuid, DeleteTopicsRequest, ResponseChannel),
 }
 
 /// A handle to a broker connection.
@@ -78,6 +80,16 @@ impl Broker {
     /// If the request fails, the original request payload is returned.
     pub(crate) async fn produce(&self, id: uuid::Uuid, req: ProduceRequest, tx: MsgTx) {
         let _ = self.chan.send(Msg::Produce(id, req, tx)).await; // Unreachable error case.
+    }
+
+    /// Submit a list of topics to create with options.
+    pub(crate) async fn create_topics<T: Into<ResponseChannel>>(&self, id: uuid::Uuid, req: CreateTopicsRequest, tx: T) {
+        let _ = self.chan.send(Msg::CreateTopics(id, req, tx.into())).await; // Unreachable error case.
+    }
+
+    /// Submit a list of topics to delete.
+    pub(crate) async fn delete_topics<T: Into<ResponseChannel>>(&self, id: uuid::Uuid, req: DeleteTopicsRequest, tx: T) {
+        let _ = self.chan.send(Msg::DeleteTopics(id, req, tx.into())).await; // Unreachable error case.
     }
 
     /// Submit a list offsets request to the broker.
@@ -165,6 +177,8 @@ impl BrokerTask {
             Msg::Fetch(id, req, tx) => self.fetch(writer, id, req, Some(tx)).await,
             Msg::FindCoordinator(id, req, tx) => self.find_coordinator(writer, id, req, Some(tx)).await,
             Msg::ListOffsets(id, req, tx) => self.list_offsets(writer, id, req, Some(tx)).await,
+            Msg::CreateTopics(id, req, tx) => self.create_topics(writer, id, req, Some(tx)).await,
+            Msg::DeleteTopics(id, req, tx) => self.delete_topics(writer, id, req, Some(tx)).await,
         }
     }
 
@@ -344,6 +358,60 @@ impl BrokerTask {
             request: Request {
                 header,
                 kind: RequestKind::FindCoordinatorRequest(req),
+            },
+            api_version: supported_versions.max,
+            api_key,
+            chan,
+        };
+        self.write(writer, correlation_id, req).await
+    }
+
+    async fn create_topics(&mut self, writer: &mut KafkaWriter, id: uuid::Uuid, req: CreateTopicsRequest, chan: Option<ResponseChannel>) -> Result<()> {
+        let correlation_id = self.next_correlation_id;
+        self.next_correlation_id = self.next_correlation_id.wrapping_add(1);
+
+        let (min, max) = self.api_versions.get(&CreateTopicsRequest::KEY).copied().unwrap_or((0, 0));
+        let supported_versions = CreateTopicsRequest::VERSIONS.intersect(&VersionRange { min, max });
+        tracing::debug!(?supported_versions, correlation_id, "sending create topics request");
+
+        let api_key = ApiKey::CreateTopicsKey;
+        let mut header = RequestHeader::default();
+        header.request_api_key = api_key as i16;
+        header.request_api_version = supported_versions.max;
+        header.correlation_id = correlation_id;
+
+        let req = OutboundRequest {
+            id,
+            request: Request {
+                header,
+                kind: RequestKind::CreateTopicsRequest(req),
+            },
+            api_version: supported_versions.max,
+            api_key,
+            chan,
+        };
+        self.write(writer, correlation_id, req).await
+    }
+
+    async fn delete_topics(&mut self, writer: &mut KafkaWriter, id: uuid::Uuid, req: DeleteTopicsRequest, chan: Option<ResponseChannel>) -> Result<()> {
+        let correlation_id = self.next_correlation_id;
+        self.next_correlation_id = self.next_correlation_id.wrapping_add(1);
+
+        let (min, max) = self.api_versions.get(&DeleteTopicsRequest::KEY).copied().unwrap_or((0, 0));
+        let supported_versions = DeleteTopicsRequest::VERSIONS.intersect(&VersionRange { min, max });
+        tracing::debug!(?supported_versions, correlation_id, "sending delete topics request");
+
+        let api_key = ApiKey::DeleteTopicsKey;
+        let mut header = RequestHeader::default();
+        header.request_api_key = api_key as i16;
+        header.request_api_version = supported_versions.max;
+        header.correlation_id = correlation_id;
+
+        let req = OutboundRequest {
+            id,
+            request: Request {
+                header,
+                kind: RequestKind::DeleteTopicsRequest(req),
             },
             api_version: supported_versions.max,
             api_key,

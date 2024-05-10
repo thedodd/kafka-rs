@@ -6,6 +6,10 @@ use bytes::{Bytes, BytesMut};
 use kafka_protocol::{
     indexmap::IndexMap,
     messages::{
+        create_topics_request::CreateTopicsRequest,
+        create_topics_response::CreateTopicsResponse,
+        delete_topics_request::DeleteTopicsRequest,
+        delete_topics_response::DeleteTopicsResponse,
         fetch_request::{FetchPartition, FetchTopic},
         list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
         produce_request::PartitionProduceData,
@@ -305,6 +309,11 @@ impl Client {
             last_ptn: -1,
         }
     }
+
+    /// Build an admin client.
+    pub fn admin(&self) -> Admin {
+        Admin { _client: self.clone() }
+    }
 }
 
 /// A message to be encoded as a Kafka record within a record batch.
@@ -436,7 +445,7 @@ impl TopicProducer {
         sticky_broker.conn.produce(uid, req, self.tx.clone()).await;
         let res = loop {
             let Some(res) = self.rx.recv().await else {
-                unreachable!("both ends of channel are heald, receiving None should not be possible")
+                unreachable!("both ends of channel are held, receiving None should not be possible")
             };
             if res.id == uid {
                 break res;
@@ -492,4 +501,57 @@ pub(crate) async fn unpack_broker_response(rx: oneshot::Receiver<BrokerResponse>
         .map_err(|_| ClientError::Other("response channel dropped by broker, which should never happen".into()))?
         .result
         .map_err(ClientError::BrokerError)
+}
+
+pub struct Admin {
+    /// The client handle from which this producer was created.
+    _client: Client,
+}
+
+impl Admin {
+    /// Creates new topics in the Kafka Cluster.
+    pub async fn create_topics(&self, request: CreateTopicsRequest) -> ClientResult<CreateTopicsResponse> {
+        if request.topics.is_empty() {
+            return Err(ClientError::NoTopicsSpecified);
+        }
+        let cluster = self._client.get_cluster_metadata_cache().await?;
+        let (tx, rx) = oneshot::channel();
+
+        return if let Some(leader) = &cluster.controller {
+            let uid = uuid::Uuid::new_v4();
+            leader.conn.create_topics(uid, request, tx).await;
+            unpack_broker_response(rx).await.and_then(|(_, res)| {
+                if let ResponseKind::CreateTopicsResponse(inner) = res {
+                    Ok(inner)
+                } else {
+                    Err(ClientError::MalformedResponse)
+                }
+            })
+        } else {
+            Err(ClientError::NoControllerFound)
+        };
+    }
+
+    /// Delete topics from the Kafka Cluster.
+    pub async fn delete_topics(&self, request: DeleteTopicsRequest) -> ClientResult<DeleteTopicsResponse> {
+        if request.topics.is_empty() {
+            return Err(ClientError::NoTopicsSpecified);
+        }
+        let cluster = self._client.get_cluster_metadata_cache().await?;
+        let (tx, rx) = oneshot::channel();
+
+        return if let Some(leader) = &cluster.controller {
+            let uid = uuid::Uuid::new_v4();
+            leader.conn.delete_topics(uid, request, tx).await;
+            unpack_broker_response(rx).await.and_then(|(_, res)| {
+                if let ResponseKind::DeleteTopicsResponse(inner) = res {
+                    Ok(inner)
+                } else {
+                    Err(ClientError::MalformedResponse)
+                }
+            })
+        } else {
+            Err(ClientError::NoControllerFound)
+        };
+    }
 }

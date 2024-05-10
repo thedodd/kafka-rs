@@ -47,6 +47,10 @@ pub enum ClientError {
     NoBrokerFound,
     #[error("{0}")]
     Other(String),
+    #[error("no topics were specified in the request")]
+    NoTopicsSpecified,
+    #[error("no controller was found in the cluster metadata")]
+    NoControllerFound,
 }
 
 /// Broker connection level error.
