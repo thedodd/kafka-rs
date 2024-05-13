@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use kafka_protocol::messages::metadata_response::MetadataResponseBroker;
+use kafka_protocol::messages::metadata_response::{MetadataResponseBroker, MetadataResponsePartition};
 use kafka_protocol::messages::{BrokerId, MetadataResponse, ResponseKind};
 use kafka_protocol::protocol::StrBytes;
 use tokio::sync::{mpsc, watch};
@@ -30,7 +30,7 @@ pub(crate) struct Cluster {
     /// Broker connections and metadata of all discovered cluster brokers.
     pub(crate) brokers: BTreeMap<BrokerId, BrokerMetaPtr>,
     /// All topics which have been discovered from cluster metadata queries.
-    pub(crate) topics: BTreeMap<StrBytes, BTreeMap<i32, BrokerMetaPtr>>,
+    pub(crate) topics: BTreeMap<StrBytes, BTreeMap<i32, PartitionMetadata>>,
 }
 
 impl Cluster {
@@ -42,6 +42,15 @@ impl Cluster {
             topics: Default::default(),
         }
     }
+}
+
+/// Metadata on a topic partition.
+#[derive(Clone, Debug)]
+pub(crate) struct PartitionMetadata {
+    /// Connection handle to the partition's leader.
+    pub(crate) leader: Option<BrokerMetaPtr>,
+    /// The last metadata response from a broker for this partition.
+    pub(crate) metadata: MetadataResponsePartition,
 }
 
 /// Metadata and connection to a Kafka broker.
@@ -78,6 +87,8 @@ pub(crate) struct ClientTask {
     ///
     /// This is typically not needed. This only applies after cluster metadata has been gathered.
     block_list: Option<Vec<i32>>,
+    /// The client's metadata policy.
+    metadata_policy: MetadataPolicy,
     /// The channel used for receiving client interaction requests.
     rx: mpsc::Receiver<Msg>,
     /// The channel used for receiving responses from brokers.
@@ -99,12 +110,13 @@ pub(crate) struct ClientTask {
 
 impl ClientTask {
     /// Construct a new instance.
-    pub(crate) fn new(seed_list: Vec<String>, block_list: Option<Vec<i32>>, rx: mpsc::Receiver<Msg>, internal: bool, shutdown: CancellationToken) -> Self {
+    pub(crate) fn new(seed_list: Vec<String>, block_list: Option<Vec<i32>>, metadata_policy: MetadataPolicy, rx: mpsc::Receiver<Msg>, internal: bool, shutdown: CancellationToken) -> Self {
         let (bootstrap_tx, bootstrap_rx) = watch::channel(false);
         let (resp_tx, resp_rx) = mpsc::unbounded_channel();
         Self {
             seed_list,
             block_list,
+            metadata_policy,
             rx,
             resp_tx,
             resp_rx,
@@ -117,7 +129,10 @@ impl ClientTask {
 
     /// Construct a new instance.
     pub(crate) async fn run(mut self) {
-        self.bootstrap_cluster().await;
+        match &self.metadata_policy {
+            MetadataPolicy::Automatic { .. } => self.bootstrap_cluster().await,
+            MetadataPolicy::Manual => (),
+        }
 
         tracing::debug!("kafka client initialized");
         loop {
@@ -130,9 +145,15 @@ impl ClientTask {
         tracing::debug!("kafka client has shutdown");
     }
 
-    async fn handle_client_msg(&mut self, _msg: Msg) {
-        // TODO: probably will only need this for fetching updated cluster metadata and such.
-        // TODO: setup an interval for fetching updated metadata from cluster.
+    /// Handle messages recieved from client handles.
+    async fn handle_client_msg(&mut self, msg: Msg) {
+        // TODO: setup an interval for fetching updated metadata from cluster. Actually, probably make this configurable:
+        // - metadata is either manual or automatic,
+        // - manual, then only update metadata based on manually provided payloads given to this client.
+        match msg {
+            #[cfg(feature = "internal")]
+            Msg::UpdateClusterMetadata(payload) => self.update_cluster_metadata(payload),
+        }
     }
 
     /// Bootstrap cluster connections, API versions, and metadata, all from the starting seed list of brokers.
@@ -175,7 +196,6 @@ impl ClientTask {
 
                 // Establish connections to any newly discovered brokers.
                 self.update_cluster_metadata(meta);
-                let _ = self.bootstrap_tx.send(true);
                 return; // We only need 1 initial payload of metadata, so return here.
             }
 
@@ -214,15 +234,49 @@ impl ClientTask {
                     continue;
                 };
                 let ptns = cluster.topics.entry(id.0.clone()).or_default();
-                if let Some(broker) = cluster.brokers.get(&ptn.leader_id).cloned() {
-                    ptns.insert(ptn.partition_index, broker);
-                }
+                let idx = ptn.partition_index;
+                let meta = PartitionMetadata {
+                    leader: cluster.brokers.get(&ptn.leader_id).cloned(),
+                    metadata: ptn,
+                };
+                ptns.insert(idx, meta);
             }
         }
         tracing::debug!(?cluster, "cluster metadata updated");
         self.cluster.store(cluster_ptr);
+        if !*self.bootstrap_tx.borrow() {
+            let _ = self.bootstrap_tx.send(true);
+        }
     }
 }
 
 /// A message from a client.
-pub(crate) enum Msg {}
+pub(crate) enum Msg {
+    /// Update the client's cluster metadata based on the given payload.
+    #[cfg(feature = "internal")]
+    UpdateClusterMetadata(MetadataResponse),
+}
+
+/// The client's policy for fetching and updating cluster metadata.
+pub enum MetadataPolicy {
+    Automatic {
+        /// The interval at which metadata should be polled from the cluster.
+        ///
+        /// Default is every 30s. This value to be configured as needed; however, the client will
+        /// not stack metadata requests. This is your cluster you are querying. There is no need to
+        /// query it aggressively for metadata updates.
+        interval: Duration,
+    },
+    /// The cilent will neither bootstrap its initial metadata, nor will it poll the cluster for metadata updates.
+    ///
+    /// All metadata updates will take place through the client's `update_metadata` method, which is gated behind
+    /// the `internal` feature flag.
+    #[cfg(feature = "internal")]
+    Manual,
+}
+
+impl Default for MetadataPolicy {
+    fn default() -> Self {
+        MetadataPolicy::Automatic { interval: Duration::from_secs(30) }
+    }
+}

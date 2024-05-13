@@ -17,8 +17,10 @@ use kafka_protocol::{
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
-use crate::clitask::{ClientTask, ClusterMeta, Msg};
+use crate::clitask::{ClientTask, ClusterMeta, MetadataPolicy, Msg};
 use crate::error::ClientError;
+#[cfg(feature = "internal")]
+use crate::internal::InternalClient;
 use crate::{broker::BrokerResponse, error::ClientResult};
 
 /*
@@ -44,11 +46,11 @@ pub type MessageHeaders = IndexMap<StrBytes, Option<Bytes>>;
 #[derive(Clone)]
 pub struct Client {
     /// The channel used for communicating with the client task.
-    _tx: mpsc::Sender<Msg>,
+    pub(crate) tx: mpsc::Sender<Msg>,
     /// Discovered metadata on a Kafka cluster along with broker connections.
     ///
     /// NOTE WELL: this value should never be updated outside of the `ClientTask`.
-    cluster: ClusterMeta,
+    pub(crate) cluster: ClusterMeta,
     /// The shutdown signal for this client, which will be triggered once all client handles are dropped.
     _shutdown: Arc<DropGuard>,
 }
@@ -58,11 +60,11 @@ impl Client {
     pub fn new(seed_list: Vec<String>) -> Self {
         let (tx, rx) = mpsc::channel(1_000);
         let shutdown = CancellationToken::new();
-        let task = ClientTask::new(seed_list, None, rx, false, shutdown.clone());
+        let task = ClientTask::new(seed_list, None, MetadataPolicy::default(), rx, false, shutdown.clone());
         let topics = task.cluster.clone();
         tokio::spawn(task.run());
         Self {
-            _tx: tx,
+            tx,
             cluster: topics,
             _shutdown: Arc::new(shutdown.drop_guard()),
         }
@@ -74,18 +76,21 @@ impl Client {
     ///   cluster metadata. The metadata will be used to establish connections to all other brokers.
     /// - `block_list`: an optional set of broker IDs for which connections should not be established.
     ///   This is typically not needed. This only applies after cluster metadata has been gathered.
+    ///
+    /// The metadata policy is set to `Manual` for this constructor.
     #[cfg(feature = "internal")]
-    pub fn new_internal(seed_list: Vec<String>, block_list: Vec<i32>) -> Self {
+    pub fn new_internal(seed_list: Vec<String>, block_list: Vec<i32>) -> InternalClient {
         let (tx, rx) = mpsc::channel(1_000);
         let shutdown = CancellationToken::new();
-        let task = ClientTask::new(seed_list, Some(block_list), rx, true, shutdown.clone());
-        let topics = task.cluster.clone();
+        let task = ClientTask::new(seed_list, Some(block_list), MetadataPolicy::Manual, rx, true, shutdown.clone());
+        let cluster = task.cluster.clone();
         tokio::spawn(task.run());
-        Self {
-            _tx: tx,
-            cluster: topics,
+        let cli = Self {
+            tx,
+            cluster,
             _shutdown: Arc::new(shutdown.drop_guard()),
-        }
+        };
+        InternalClient::new(cli)
     }
 
     /// Get cluster metadata from the broker specified by ID.
@@ -130,7 +135,8 @@ impl Client {
 
         // Get the broker responsible for the target topic/partition.
         let topic_ptns = cluster.topics.get(&topic).ok_or(ClientError::UnknownTopic(topic.to_string()))?;
-        let broker = topic_ptns.get(&ptn).ok_or(ClientError::UnknownPartition(topic.to_string(), ptn))?;
+        let ptn_meta = topic_ptns.get(&ptn).ok_or(ClientError::UnknownPartition(topic.to_string(), ptn))?;
+        let broker = ptn_meta.leader.clone().ok_or(ClientError::NoPartitionLeader(topic.to_string(), ptn))?;
 
         // Build request.
         let uid = uuid::Uuid::new_v4();
@@ -185,7 +191,8 @@ impl Client {
 
         // Get the broker responsible for the target topic/partition.
         let topic_ptns = cluster.topics.get(&topic).ok_or(ClientError::UnknownTopic(topic.to_string()))?;
-        let broker = topic_ptns.get(&ptn).ok_or(ClientError::UnknownPartition(topic.to_string(), ptn))?;
+        let ptn_meta = topic_ptns.get(&ptn).ok_or(ClientError::UnknownPartition(topic.to_string(), ptn))?;
+        let broker = ptn_meta.leader.clone().ok_or(ClientError::NoPartitionLeader(topic.to_string(), ptn))?;
 
         // Build request.
         let uid = uuid::Uuid::new_v4();
@@ -336,8 +343,9 @@ impl TopicProducer {
         // Target the next partition of this topic for this batch.
         let Some((sticky_ptn, sticky_broker)) = topic_ptns
             .range((self.last_ptn + 1)..)
+            .filter_map(|(ptn, meta)| meta.leader.clone().map(|leader| (ptn, leader)))
             .next()
-            .or_else(|| topic_ptns.range(..).next())
+            .or_else(|| topic_ptns.range(..).filter_map(|(ptn, meta)| meta.leader.clone().map(|leader| (ptn, leader))).next())
             .map(|(key, val)| (*key, val.clone()))
         else {
             return Err(ClientError::NoPartitionsAvailable(self.topic.to_string()));
@@ -431,7 +439,7 @@ pub enum ListOffsetsPosition {
 }
 
 /// Await and unpack a broker response.
-async fn unpack_broker_response(rx: oneshot::Receiver<BrokerResponse>) -> ClientResult<(ResponseHeader, ResponseKind)> {
+pub(crate) async fn unpack_broker_response(rx: oneshot::Receiver<BrokerResponse>) -> ClientResult<(ResponseHeader, ResponseKind)> {
     rx.await
         .map_err(|_| ClientError::Other("response channel dropped by broker, which should never happen".into()))?
         .result
