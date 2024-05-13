@@ -1,6 +1,8 @@
 //! Crate error types.
 
-use kafka_protocol::messages::RequestKind;
+use kafka_protocol::{messages::RequestKind, ResponseError};
+
+use crate::StrBytes;
 
 /// Client results from interaction with a Kafka cluster.
 pub type ClientResult<T> = std::result::Result<T, ClientError>;
@@ -29,6 +31,12 @@ pub enum ClientError {
     /// The specified topic partition is unknown to the cluster.
     #[error("the specified topic partition is unknown to the cluster: {0}/{1}")]
     UnknownPartition(String, i32),
+    /// The specified topic partition is does not currently have a known leader.
+    #[error("the specified topic partition is does not currently have a known leader: {0}/{1}")]
+    NoPartitionLeader(String, i32),
+    /// An error was returned in a response from a broker.
+    #[error("an error was returned in a response from a broker: {0} {1:?} {2:?}")]
+    ResponseError(i16, Option<ResponseError>, Option<StrBytes>),
     #[error("{0}")]
     Other(String),
 }
