@@ -1,6 +1,6 @@
 //! Kafka client implementation.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use bytes::{Bytes, BytesMut};
 use kafka_protocol::{
@@ -9,15 +9,16 @@ use kafka_protocol::{
         fetch_request::{FetchPartition, FetchTopic},
         list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
         produce_request::PartitionProduceData,
-        FetchRequest, ListOffsetsRequest, MetadataResponse, ProduceRequest, ResponseHeader, ResponseKind,
+        FetchRequest, FindCoordinatorRequest, FindCoordinatorResponse, ListOffsetsRequest, MetadataResponse, ProduceRequest, ResponseHeader, ResponseKind,
     },
     protocol::StrBytes,
     records::{Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions, TimestampType},
+    ResponseError,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
-use crate::clitask::{ClientTask, ClusterMeta, MetadataPolicy, Msg};
+use crate::clitask::{ClientTask, Cluster, ClusterMeta, MetadataPolicy, Msg};
 use crate::error::ClientError;
 #[cfg(feature = "internal")]
 use crate::internal::InternalClient;
@@ -95,13 +96,7 @@ impl Client {
 
     /// Get cluster metadata from the broker specified by ID.
     pub async fn get_metadata(&self, broker_id: i32) -> ClientResult<MetadataResponse> {
-        let mut cluster = self.cluster.load();
-        if !*cluster.bootstrap.borrow() {
-            let mut sig = cluster.bootstrap.clone();
-            let _ = sig.wait_for(|val| *val).await; // Ensure the cluster metadata is bootstrapped.
-            cluster = self.cluster.load();
-        }
-
+        let cluster = self.get_cluster_metadata_cache().await?;
         let broker = cluster
             .brokers
             .get(&broker_id)
@@ -126,12 +121,7 @@ impl Client {
 
     /// List topic partition offsets.
     pub async fn list_offsets(&self, topic: StrBytes, ptn: i32, pos: ListOffsetsPosition) -> ClientResult<i64> {
-        let mut cluster = self.cluster.load();
-        if !*cluster.bootstrap.borrow() {
-            let mut sig = cluster.bootstrap.clone();
-            let _ = sig.wait_for(|val| *val).await; // Ensure the cluster metadata is bootstrapped.
-            cluster = self.cluster.load();
-        }
+        let cluster = self.get_cluster_metadata_cache().await?;
 
         // Get the broker responsible for the target topic/partition.
         let topic_ptns = cluster.topics.get(&topic).ok_or(ClientError::UnknownTopic(topic.to_string()))?;
@@ -182,12 +172,7 @@ impl Client {
 
     /// Fetch a batch of records from the target topic partition.
     pub async fn fetch(&self, topic: StrBytes, ptn: i32, start: i64) -> ClientResult<Option<Vec<Record>>> {
-        let mut cluster = self.cluster.load();
-        if !*cluster.bootstrap.borrow() {
-            let mut sig = cluster.bootstrap.clone();
-            let _ = sig.wait_for(|val| *val).await; // Ensure the cluster metadata is bootstrapped.
-            cluster = self.cluster.load();
-        }
+        let cluster = self.get_cluster_metadata_cache().await?;
 
         // Get the broker responsible for the target topic/partition.
         let topic_ptns = cluster.topics.get(&topic).ok_or(ClientError::UnknownTopic(topic.to_string()))?;
@@ -239,6 +224,66 @@ impl Client {
         let records = RecordBatchDecoder::decode(&mut batch).map_err(|_| ClientError::MalformedResponse)?;
 
         Ok(Some(records))
+    }
+
+    /// Get the cached cluster metadata.
+    ///
+    /// If the cluster metadata has not yet been bootstrapped, then this routine will wait for
+    /// a maximum of 10s for the metadata to be bootstrapped, and will then timeout.
+    async fn get_cluster_metadata_cache(&self) -> ClientResult<Arc<Cluster>> {
+        let mut cluster = self.cluster.load();
+        if !*cluster.bootstrap.borrow() {
+            let mut sig = cluster.bootstrap.clone();
+            let _ = tokio::time::timeout(Duration::from_secs(10), sig.wait_for(|val| *val))
+                .await
+                .map_err(|_err| ClientError::ClusterMetadataTimeout)?
+                .map_err(|_err| ClientError::ClusterMetadataTimeout)?;
+            cluster = self.cluster.load();
+        }
+        Ok(cluster.clone())
+    }
+
+    /// Find the coordinator for the given group.
+    pub async fn find_coordinator(&self, key: StrBytes, key_type: i8, broker_id: Option<i32>) -> ClientResult<FindCoordinatorResponse> {
+        let cluster = self.get_cluster_metadata_cache().await?;
+
+        // Get the specified broker connection, else get the first available.
+        let broker = broker_id
+            .and_then(|id| cluster.brokers.get(&id).cloned())
+            .or_else(|| {
+                // TODO: get random broker.
+                cluster.brokers.first_key_value().map(|(_, broker)| broker.clone())
+            })
+            .ok_or_else(|| ClientError::NoBrokerFound)?;
+
+        // Build request.
+        let uid = uuid::Uuid::new_v4();
+        let mut req = FindCoordinatorRequest::default();
+        req.key = key;
+        req.key_type = key_type;
+
+        // Send request.
+        let (tx, rx) = oneshot::channel();
+        broker.conn.find_coordinator(uid, req, tx).await;
+
+        // Unpack response & handle errors.
+        unpack_broker_response(rx)
+            .await
+            .and_then(|(_, res)| {
+                tracing::debug!("res: {:?}", res);
+                if let ResponseKind::FindCoordinatorResponse(res) = res {
+                    Ok(res)
+                } else {
+                    Err(ClientError::MalformedResponse)
+                }
+            })
+            .and_then(|res| {
+                // Handle broker response codes.
+                if res.error_code != 0 {
+                    return Err(ClientError::ResponseError(res.error_code, ResponseError::try_from_code(res.error_code), res.error_message));
+                }
+                Ok(res)
+            })
     }
 
     /// Build a producer for a topic.

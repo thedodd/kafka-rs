@@ -15,7 +15,7 @@ use crate::{Client, StrBytes};
 #[derive(Clone)]
 pub struct InternalClient {
     /// A handle to the underlying client.
-    client: Client,
+    pub client: Client,
 }
 
 impl InternalClient {
