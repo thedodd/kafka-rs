@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, time::Duration};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::prelude::*;
-use kafka_protocol::messages::{FetchRequest, ListOffsetsRequest};
+use kafka_protocol::messages::{FetchRequest, FindCoordinatorRequest, ListOffsetsRequest};
 use kafka_protocol::{
     messages::{metadata_response::MetadataResponseBroker, ApiKey, ApiVersionsRequest, MetadataRequest, ProduceRequest, RequestHeader, RequestKind, ResponseHeader, ResponseKind},
     protocol::{Decodable, Message, Request as RequestProto, VersionRange},
@@ -40,6 +40,7 @@ pub(crate) enum Msg {
     GetMetadata(uuid::Uuid, ResponseChannel, bool),
     Produce(uuid::Uuid, ProduceRequest, MsgTx),
     Fetch(uuid::Uuid, FetchRequest, ResponseChannel),
+    FindCoordinator(uuid::Uuid, FindCoordinatorRequest, ResponseChannel),
     ListOffsets(uuid::Uuid, ListOffsetsRequest, ResponseChannel),
 }
 
@@ -87,6 +88,11 @@ impl Broker {
     /// Submit a fetch request to the broker.
     pub(crate) async fn fetch<T: Into<ResponseChannel>>(&self, id: uuid::Uuid, req: FetchRequest, tx: T) {
         let _ = self.chan.send(Msg::Fetch(id, req, tx.into())).await; // Unreachable error case.
+    }
+
+    /// Submit a FindCoordinator request to the broker.
+    pub(crate) async fn find_coordinator<T: Into<ResponseChannel>>(&self, id: uuid::Uuid, req: FindCoordinatorRequest, tx: T) {
+        let _ = self.chan.send(Msg::FindCoordinator(id, req, tx.into())).await; // Unreachable error case.
     }
 }
 
@@ -157,6 +163,7 @@ impl BrokerTask {
             Msg::GetMetadata(id, tx, internal) => self.get_metadata(writer, id, Some(tx), internal).await,
             Msg::Produce(id, req, tx) => self.produce(writer, id, req, Some(tx)).await,
             Msg::Fetch(id, req, tx) => self.fetch(writer, id, req, Some(tx)).await,
+            Msg::FindCoordinator(id, req, tx) => self.find_coordinator(writer, id, req, Some(tx)).await,
             Msg::ListOffsets(id, req, tx) => self.list_offsets(writer, id, req, Some(tx)).await,
         }
     }
@@ -310,6 +317,33 @@ impl BrokerTask {
             request: Request {
                 header,
                 kind: RequestKind::ListOffsetsRequest(req),
+            },
+            api_version: supported_versions.max,
+            api_key,
+            chan,
+        };
+        self.write(writer, correlation_id, req).await
+    }
+
+    async fn find_coordinator(&mut self, writer: &mut KafkaWriter, id: uuid::Uuid, req: FindCoordinatorRequest, chan: Option<ResponseChannel>) -> Result<()> {
+        let correlation_id = self.next_correlation_id;
+        self.next_correlation_id = self.next_correlation_id.wrapping_add(1);
+
+        let (min, max) = self.api_versions.get(&FindCoordinatorRequest::KEY).copied().unwrap_or((0, 0));
+        let supported_versions = FindCoordinatorRequest::VERSIONS.intersect(&VersionRange { min, max });
+        tracing::debug!(?supported_versions, correlation_id, "sending find coordinator request");
+
+        let api_key = ApiKey::FindCoordinatorKey;
+        let mut header = RequestHeader::default();
+        header.request_api_key = api_key as i16;
+        header.request_api_version = supported_versions.max;
+        header.correlation_id = correlation_id;
+
+        let req = OutboundRequest {
+            id,
+            request: Request {
+                header,
+                kind: RequestKind::FindCoordinatorRequest(req),
             },
             api_version: supported_versions.max,
             api_key,

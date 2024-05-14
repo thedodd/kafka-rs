@@ -8,6 +8,8 @@ use crate::StrBytes;
 pub type ClientResult<T> = std::result::Result<T, ClientError>;
 
 /// Client errors from interacting with a Kafka cluster.
+///
+/// TODO: probably just refactor this into an opaque Retryable and Fatal errors, which just dump info on debug.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     /// Error while interacting with a broker.
@@ -37,6 +39,12 @@ pub enum ClientError {
     /// An error was returned in a response from a broker.
     #[error("an error was returned in a response from a broker: {0} {1:?} {2:?}")]
     ResponseError(i16, Option<ResponseError>, Option<StrBytes>),
+    /// Timeout while waiting for cluster metadata to bootstrap.
+    #[error("timeout while waiting for cluster metadata to bootstrap")]
+    ClusterMetadataTimeout,
+    /// Could not find a broker specified by ID, or any broker at all.
+    #[error("could not find a broker specified by ID, or any broker at all")]
+    NoBrokerFound,
     #[error("{0}")]
     Other(String),
 }
