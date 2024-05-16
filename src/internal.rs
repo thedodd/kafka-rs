@@ -34,14 +34,8 @@ impl InternalClient {
 
     /// Fetch a payload of data as a replica from the target topic partition leader.
     pub async fn fetch_as_replica(&self, topic: StrBytes, ptn: i32, replica_id: i32, replica_log_start: i64, fetch_from: i64) -> ClientResult<PartitionData> {
-        let mut cluster = self.client.cluster.load();
-        if !*cluster.bootstrap.borrow() {
-            let mut sig = cluster.bootstrap.clone();
-            let _ = sig.wait_for(|val| *val).await; // Ensure the cluster metadata is bootstrapped.
-            cluster = self.client.cluster.load();
-        }
-
         // Get the broker responsible for the target topic/partition.
+        let cluster = self.client.get_cluster_metadata_cache().await?;
         let topic_ptns = cluster.topics.get(&topic).ok_or(ClientError::UnknownTopic(topic.to_string()))?;
         let ptn_meta = topic_ptns.get(&ptn).ok_or(ClientError::UnknownPartition(topic.to_string(), ptn))?;
         let broker = ptn_meta.leader.clone().ok_or(ClientError::NoPartitionLeader(topic.to_string(), ptn))?;

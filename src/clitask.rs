@@ -131,6 +131,7 @@ impl ClientTask {
     pub(crate) async fn run(mut self) {
         match &self.metadata_policy {
             MetadataPolicy::Automatic { .. } => self.bootstrap_cluster().await,
+            #[cfg(feature = "internal")]
             MetadataPolicy::Manual => (),
         }
 

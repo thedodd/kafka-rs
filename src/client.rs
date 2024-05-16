@@ -230,7 +230,7 @@ impl Client {
     ///
     /// If the cluster metadata has not yet been bootstrapped, then this routine will wait for
     /// a maximum of 10s for the metadata to be bootstrapped, and will then timeout.
-    async fn get_cluster_metadata_cache(&self) -> ClientResult<Arc<Cluster>> {
+    pub(crate) async fn get_cluster_metadata_cache(&self) -> ClientResult<Arc<Cluster>> {
         let mut cluster = self.cluster.load();
         if !*cluster.bootstrap.borrow() {
             let mut sig = cluster.bootstrap.clone();
@@ -484,6 +484,9 @@ pub enum ListOffsetsPosition {
 }
 
 /// Await and unpack a broker response.
+///
+/// TODO: turn this into a macro which can destructure to the match enum variant needed.
+/// That will help reduce error handling boilerplate even further.
 pub(crate) async fn unpack_broker_response(rx: oneshot::Receiver<BrokerResponse>) -> ClientResult<(ResponseHeader, ResponseKind)> {
     rx.await
         .map_err(|_| ClientError::Other("response channel dropped by broker, which should never happen".into()))?
