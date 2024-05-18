@@ -133,6 +133,43 @@ struct BrokerTask {
     next_correlation_id: i32,
 }
 
+macro_rules! broker_request {
+    ($name:ident, $req_ty:ty, $api_key:expr, $kind:expr) => {
+        impl BrokerTask {
+            async fn $name(&mut self, writer: &mut KafkaWriter, id: uuid::Uuid, req: $req_ty, chan: Option<ResponseChannel>) -> Result<()> {
+                let correlation_id = self.next_correlation_id;
+                self.next_correlation_id = self.next_correlation_id.wrapping_add(1);
+
+                let (min, max) = self.api_versions.get(&<$req_ty>::KEY).copied().unwrap_or((0, 0));
+                let supported_versions = <$req_ty>::VERSIONS.intersect(&VersionRange { min, max });
+                tracing::debug!(?supported_versions, correlation_id, "sending create topics request");
+
+                let api_key = $api_key;
+                let mut header = RequestHeader::default();
+                header.request_api_key = api_key as i16;
+                header.request_api_version = supported_versions.max;
+                header.correlation_id = correlation_id;
+
+                let req = OutboundRequest {
+                    id,
+                    request: Request { header, kind: $kind(req) },
+                    api_version: supported_versions.max,
+                    api_key: $api_key,
+                    chan,
+                };
+                self.write(writer, correlation_id, req).await
+            }
+        }
+    };
+}
+
+broker_request!(produce, ProduceRequest, ApiKey::ProduceKey, RequestKind::ProduceRequest);
+broker_request!(fetch, FetchRequest, ApiKey::FetchKey, RequestKind::FetchRequest);
+broker_request!(find_coordinator, FindCoordinatorRequest, ApiKey::FindCoordinatorKey, RequestKind::FindCoordinatorRequest);
+broker_request!(list_offsets, ListOffsetsRequest, ApiKey::ListOffsetsKey, RequestKind::ListOffsetsRequest);
+broker_request!(create_topics, CreateTopicsRequest, ApiKey::CreateTopicsKey, RequestKind::CreateTopicsRequest);
+broker_request!(delete_topics, DeleteTopicsRequest, ApiKey::DeleteTopicsKey, RequestKind::DeleteTopicsRequest);
+
 impl BrokerTask {
     /// Create a new instance.
     fn new(broker: BrokerConnInfo, chan: mpsc::Receiver<Msg>, shutdown: CancellationToken) -> Self {
@@ -172,8 +209,9 @@ impl BrokerTask {
     async fn handle_msg(&mut self, writer: &mut KafkaWriter, msg: Msg) -> Result<()> {
         match msg {
             // Msg::GetApiVersions(tx) => self.handle_get_api_versions(Some(tx)).await,
+            // This uses an additional `bool` so it currently doesn't work with our macro.
             Msg::GetMetadata(id, tx, internal) => self.get_metadata(writer, id, Some(tx), internal).await,
-            Msg::Produce(id, req, tx) => self.produce(writer, id, req, Some(tx)).await,
+            Msg::Produce(id, req, tx) => self.produce(writer, id, req, Some(tx.into())).await,
             Msg::Fetch(id, req, tx) => self.fetch(writer, id, req, Some(tx)).await,
             Msg::FindCoordinator(id, req, tx) => self.find_coordinator(writer, id, req, Some(tx)).await,
             Msg::ListOffsets(id, req, tx) => self.list_offsets(writer, id, req, Some(tx)).await,
@@ -254,168 +292,6 @@ impl BrokerTask {
             api_version: supported_versions.max,
             api_key,
             chan: chan.map(Into::into),
-        };
-        self.write(writer, correlation_id, req).await
-    }
-
-    async fn produce(&mut self, writer: &mut KafkaWriter, id: uuid::Uuid, req: ProduceRequest, chan: Option<MsgTx>) -> Result<()> {
-        let correlation_id = self.next_correlation_id;
-        self.next_correlation_id = self.next_correlation_id.wrapping_add(1);
-
-        let (min, max) = self.api_versions.get(&ProduceRequest::KEY).copied().unwrap_or((0, 0));
-        let supported_versions = ProduceRequest::VERSIONS.intersect(&VersionRange { min, max });
-        tracing::debug!(?supported_versions, correlation_id, "sending produce request");
-
-        let api_key = ApiKey::ProduceKey;
-        let mut header = RequestHeader::default();
-        header.request_api_key = api_key as i16;
-        header.request_api_version = supported_versions.max;
-        header.correlation_id = correlation_id;
-
-        let req = OutboundRequest {
-            id,
-            request: Request {
-                header,
-                kind: RequestKind::ProduceRequest(req),
-            },
-            api_version: supported_versions.max,
-            api_key,
-            chan: chan.map(Into::into),
-        };
-        self.write(writer, correlation_id, req).await
-    }
-
-    async fn fetch(&mut self, writer: &mut KafkaWriter, id: uuid::Uuid, req: FetchRequest, chan: Option<ResponseChannel>) -> Result<()> {
-        let correlation_id = self.next_correlation_id;
-        self.next_correlation_id = self.next_correlation_id.wrapping_add(1);
-
-        let (min, max) = self.api_versions.get(&FetchRequest::KEY).copied().unwrap_or((0, 0));
-        let supported_versions = FetchRequest::VERSIONS.intersect(&VersionRange { min, max });
-        tracing::debug!(?supported_versions, correlation_id, "sending fetch request");
-
-        let api_key = ApiKey::FetchKey;
-        let mut header = RequestHeader::default();
-        header.request_api_key = api_key as i16;
-        header.request_api_version = supported_versions.max;
-        header.correlation_id = correlation_id;
-
-        let req = OutboundRequest {
-            id,
-            request: Request {
-                header,
-                kind: RequestKind::FetchRequest(req),
-            },
-            api_version: supported_versions.max,
-            api_key,
-            chan,
-        };
-        self.write(writer, correlation_id, req).await
-    }
-
-    async fn list_offsets(&mut self, writer: &mut KafkaWriter, id: uuid::Uuid, req: ListOffsetsRequest, chan: Option<ResponseChannel>) -> Result<()> {
-        let correlation_id = self.next_correlation_id;
-        self.next_correlation_id = self.next_correlation_id.wrapping_add(1);
-
-        let (min, max) = self.api_versions.get(&ListOffsetsRequest::KEY).copied().unwrap_or((0, 0));
-        let supported_versions = ListOffsetsRequest::VERSIONS.intersect(&VersionRange { min, max });
-        tracing::debug!(?supported_versions, correlation_id, "sending list offsets request");
-
-        let api_key = ApiKey::ListOffsetsKey;
-        let mut header = RequestHeader::default();
-        header.request_api_key = api_key as i16;
-        header.request_api_version = supported_versions.max;
-        header.correlation_id = correlation_id;
-
-        let req = OutboundRequest {
-            id,
-            request: Request {
-                header,
-                kind: RequestKind::ListOffsetsRequest(req),
-            },
-            api_version: supported_versions.max,
-            api_key,
-            chan,
-        };
-        self.write(writer, correlation_id, req).await
-    }
-
-    async fn find_coordinator(&mut self, writer: &mut KafkaWriter, id: uuid::Uuid, req: FindCoordinatorRequest, chan: Option<ResponseChannel>) -> Result<()> {
-        let correlation_id = self.next_correlation_id;
-        self.next_correlation_id = self.next_correlation_id.wrapping_add(1);
-
-        let (min, max) = self.api_versions.get(&FindCoordinatorRequest::KEY).copied().unwrap_or((0, 0));
-        let supported_versions = FindCoordinatorRequest::VERSIONS.intersect(&VersionRange { min, max });
-        tracing::debug!(?supported_versions, correlation_id, "sending find coordinator request");
-
-        let api_key = ApiKey::FindCoordinatorKey;
-        let mut header = RequestHeader::default();
-        header.request_api_key = api_key as i16;
-        header.request_api_version = supported_versions.max;
-        header.correlation_id = correlation_id;
-
-        let req = OutboundRequest {
-            id,
-            request: Request {
-                header,
-                kind: RequestKind::FindCoordinatorRequest(req),
-            },
-            api_version: supported_versions.max,
-            api_key,
-            chan,
-        };
-        self.write(writer, correlation_id, req).await
-    }
-
-    async fn create_topics(&mut self, writer: &mut KafkaWriter, id: uuid::Uuid, req: CreateTopicsRequest, chan: Option<ResponseChannel>) -> Result<()> {
-        let correlation_id = self.next_correlation_id;
-        self.next_correlation_id = self.next_correlation_id.wrapping_add(1);
-
-        let (min, max) = self.api_versions.get(&CreateTopicsRequest::KEY).copied().unwrap_or((0, 0));
-        let supported_versions = CreateTopicsRequest::VERSIONS.intersect(&VersionRange { min, max });
-        tracing::debug!(?supported_versions, correlation_id, "sending create topics request");
-
-        let api_key = ApiKey::CreateTopicsKey;
-        let mut header = RequestHeader::default();
-        header.request_api_key = api_key as i16;
-        header.request_api_version = supported_versions.max;
-        header.correlation_id = correlation_id;
-
-        let req = OutboundRequest {
-            id,
-            request: Request {
-                header,
-                kind: RequestKind::CreateTopicsRequest(req),
-            },
-            api_version: supported_versions.max,
-            api_key,
-            chan,
-        };
-        self.write(writer, correlation_id, req).await
-    }
-
-    async fn delete_topics(&mut self, writer: &mut KafkaWriter, id: uuid::Uuid, req: DeleteTopicsRequest, chan: Option<ResponseChannel>) -> Result<()> {
-        let correlation_id = self.next_correlation_id;
-        self.next_correlation_id = self.next_correlation_id.wrapping_add(1);
-
-        let (min, max) = self.api_versions.get(&DeleteTopicsRequest::KEY).copied().unwrap_or((0, 0));
-        let supported_versions = DeleteTopicsRequest::VERSIONS.intersect(&VersionRange { min, max });
-        tracing::debug!(?supported_versions, correlation_id, "sending delete topics request");
-
-        let api_key = ApiKey::DeleteTopicsKey;
-        let mut header = RequestHeader::default();
-        header.request_api_key = api_key as i16;
-        header.request_api_version = supported_versions.max;
-        header.correlation_id = correlation_id;
-
-        let req = OutboundRequest {
-            id,
-            request: Request {
-                header,
-                kind: RequestKind::DeleteTopicsRequest(req),
-            },
-            api_version: supported_versions.max,
-            api_key,
-            chan,
         };
         self.write(writer, correlation_id, req).await
     }

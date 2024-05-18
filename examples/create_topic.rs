@@ -22,10 +22,10 @@ async fn main() -> Result<()> {
     let topic = StrBytes::from_string(std::env::var("TOPIC").context("TOPIC env var must be specified")?);
     let host = std::env::var("HOST").context("HOST env var must be specified")?;
     let port = std::env::var("PORT").context("PORT env var must be specified")?;
-    let cli = Client::new(vec![(host + ":" + &port).into()]);
+    let cli = Client::new(vec![format!("{}:{}", host, port)]);
 
     // Create new topic.
-    let mut admin = cli.admin();
+    let admin = cli.admin();
 
     let mut ctb = CreatableTopicBuilder::default();
     ctb.replication_factor(1);
