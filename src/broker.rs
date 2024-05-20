@@ -318,17 +318,21 @@ impl BrokerTask {
         tracing::trace!("handling broker response for request {}", resp.correlation_id);
         let Some(pending) = self.requests.remove(&resp.correlation_id) else { return };
         let header_version = pending.api_key.response_header_version(pending.api_version);
-        let Ok(response_header) = ResponseHeader::decode(&mut resp.body, header_version) else {
-            if let Some(chan) = pending.chan {
-                chan.send(BrokerResponse {
-                    id: pending.id,
-                    result: Err(BrokerRequestError {
-                        payload: pending.request.kind,
-                        kind: BrokerErrorKind::MalformedBrokerResponse,
-                    }),
-                });
+        let response_header = match ResponseHeader::decode(&mut resp.body, header_version) {
+            Ok(response_header) => response_header,
+            Err(err) => {
+                tracing::error!(error = ?err, "error decoding response header from broker");
+                if let Some(chan) = pending.chan {
+                    chan.send(BrokerResponse {
+                        id: pending.id,
+                        result: Err(BrokerRequestError {
+                            payload: pending.request.kind,
+                            kind: BrokerErrorKind::MalformedBrokerResponse,
+                        }),
+                    });
+                }
+                return;
             }
-            return;
         };
 
         // Decode body based on API key.
@@ -403,17 +407,21 @@ impl BrokerTask {
             ApiKey::ListTransactionsKey => ListTransactionsResponse::decode(&mut resp.body, pending.api_version).map(ResponseKind::ListTransactionsResponse),
             ApiKey::AllocateProducerIdsKey => AllocateProducerIdsResponse::decode(&mut resp.body, pending.api_version).map(ResponseKind::AllocateProducerIdsResponse),
         };
-        let Ok(response_body) = res else {
-            if let Some(chan) = pending.chan {
-                chan.send(BrokerResponse {
-                    id: pending.id,
-                    result: Err(BrokerRequestError {
-                        payload: pending.request.kind,
-                        kind: BrokerErrorKind::MalformedBrokerResponse,
-                    }),
-                });
+        let response_body = match res {
+            Ok(response_body) => response_body,
+            Err(err) => {
+                tracing::error!(error = ?err, api_key = ?pending.api_key, "error decoding response body from broker");
+                if let Some(chan) = pending.chan {
+                    chan.send(BrokerResponse {
+                        id: pending.id,
+                        result: Err(BrokerRequestError {
+                            payload: pending.request.kind,
+                            kind: BrokerErrorKind::MalformedBrokerResponse,
+                        }),
+                    });
+                }
+                return;
             }
-            return;
         };
 
         // If this is an API versions response, always update our local cache of version info.
