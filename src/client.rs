@@ -517,7 +517,7 @@ impl Admin {
         let cluster = self._client.get_cluster_metadata_cache().await?;
         let (tx, rx) = oneshot::channel();
 
-        return if let Some(leader) = &cluster.controller {
+        if let Some(leader) = &cluster.controller {
             let uid = uuid::Uuid::new_v4();
             leader.conn.create_topics(uid, request, tx).await;
             unpack_broker_response(rx).await.and_then(|(_, res)| {
@@ -529,7 +529,7 @@ impl Admin {
             })
         } else {
             Err(ClientError::NoControllerFound)
-        };
+        }
     }
 
     /// Delete topics from the Kafka Cluster.
@@ -540,7 +540,7 @@ impl Admin {
         let cluster = self._client.get_cluster_metadata_cache().await?;
         let (tx, rx) = oneshot::channel();
 
-        return if let Some(leader) = &cluster.controller {
+        if let Some(leader) = &cluster.controller {
             let uid = uuid::Uuid::new_v4();
             leader.conn.delete_topics(uid, request, tx).await;
             unpack_broker_response(rx).await.and_then(|(_, res)| {
@@ -552,6 +552,6 @@ impl Admin {
             })
         } else {
             Err(ClientError::NoControllerFound)
-        };
+        }
     }
 }

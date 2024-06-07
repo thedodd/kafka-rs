@@ -8,7 +8,10 @@ use tokio::net::TcpStream;
 use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite, LengthDelimitedCodec};
 
 /// The default max size for API messages sent to Kafka.
-const DEFAULT_MAX_SIZE: usize = 1024usize.pow(2) * 16; // 16MiB.
+///
+/// This is set to 32Mi to allow for some overhead when the broker returns a payload slight larger
+/// than the requested max, due to large batches and the like.
+const DEFAULT_MAX_SIZE: usize = 1024usize.pow(2) * 32;
 
 pub(crate) type KafkaReader = FramedRead<OwnedReadHalf, KafkaCodecReader>;
 pub(crate) type KafkaWriter = FramedWrite<OwnedWriteHalf, KafkaCodecWriter>;
