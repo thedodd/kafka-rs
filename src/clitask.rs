@@ -38,7 +38,7 @@ pub(crate) struct Cluster {
 
 impl Cluster {
     /// Construct a new instance.
-    fn new(bootstrap: watch::Receiver<bool>) -> Self {
+    pub(crate) fn new(bootstrap: watch::Receiver<bool>) -> Self {
         Self {
             bootstrap,
             brokers: Default::default(),
@@ -267,6 +267,7 @@ pub(crate) enum Msg {
 }
 
 /// The client's policy for fetching and updating cluster metadata.
+#[allow(dead_code)]
 pub enum MetadataPolicy {
     Automatic {
         /// The interval at which metadata should be polled from the cluster.

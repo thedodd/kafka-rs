@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use kafka_rs::Client;
+use kafka_rs::{Client, ClientApi};
 use tracing_subscriber::prelude::*;
 
 #[tokio::main(flavor = "current_thread")]

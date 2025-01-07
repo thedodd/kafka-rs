@@ -39,6 +39,20 @@ pub const DEFAULT_TIMEOUT: i32 = 10 * 1000;
 /// Headers of a message.
 pub type MessageHeaders = IndexMap<StrBytes, Option<Bytes>>;
 
+/// Trait definition of the Kafka client API.
+#[cfg_attr(feature = "mock", mockall::automock)]
+#[async_trait::async_trait]
+pub trait ClientApi: Send + Sync + 'static {
+    /// Get cluster metadata from the broker specified by ID.
+    async fn get_metadata(&self, broker_id: i32) -> ClientResult<MetadataResponse>;
+    /// List topic partition offsets.
+    async fn list_offsets(&self, topic: StrBytes, ptn: i32, pos: ListOffsetsPosition) -> ClientResult<i64>;
+    /// Fetch a batch of records from the target topic partition.
+    async fn fetch(&self, topic: StrBytes, ptn: i32, start: i64) -> ClientResult<Option<Vec<Record>>>;
+    /// Find the coordinator for the given group.
+    async fn find_coordinator(&self, key: StrBytes, key_type: i8, broker_id: Option<i32>) -> ClientResult<FindCoordinatorResponse>;
+}
+
 /// A Kafka client.
 ///
 /// This client is `Send + Sync + Clone`, and cloning this client to share it among application
@@ -98,8 +112,53 @@ impl Client {
         InternalClient::new(cli)
     }
 
+    /// Get the cached cluster metadata.
+    ///
+    /// If the cluster metadata has not yet been bootstrapped, then this routine will wait for
+    /// a maximum of 10s for the metadata to be bootstrapped, and will then timeout.
+    pub(crate) async fn get_cluster_metadata_cache(&self) -> ClientResult<Arc<Cluster>> {
+        let mut cluster = self.cluster.load();
+        if !*cluster.bootstrap.borrow() {
+            let mut sig = cluster.bootstrap.clone();
+            let _ = tokio::time::timeout(Duration::from_secs(10), sig.wait_for(|val| *val))
+                .await
+                .map_err(|_err| ClientError::ClusterMetadataTimeout)?
+                .map_err(|_err| ClientError::ClusterMetadataTimeout)?;
+            cluster = self.cluster.load();
+        }
+        Ok(cluster.clone())
+    }
+
+    /// Build a producer for a topic.
+    pub fn topic_producer(&self, topic: &str, acks: Acks, timeout_ms: Option<i32>, compression: Option<Compression>) -> TopicProducer {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let compression = compression.unwrap_or(Compression::None);
+        let encode_opts = RecordEncodeOptions { version: 2, compression };
+        TopicProducer {
+            _client: self.clone(),
+            tx,
+            rx,
+            cluster: self.cluster.clone(),
+            topic: StrBytes::from_string(topic.into()),
+            acks,
+            timeout_ms: timeout_ms.unwrap_or(DEFAULT_TIMEOUT),
+            encode_opts,
+            buf: BytesMut::with_capacity(1024 * 1024),
+            batch_buf: Vec::with_capacity(1024),
+            last_ptn: -1,
+        }
+    }
+
+    /// Build an admin client.
+    pub fn admin(&self) -> Admin {
+        Admin { _client: self.clone() }
+    }
+}
+
+#[async_trait::async_trait]
+impl ClientApi for Client {
     /// Get cluster metadata from the broker specified by ID.
-    pub async fn get_metadata(&self, broker_id: i32) -> ClientResult<MetadataResponse> {
+    async fn get_metadata(&self, broker_id: i32) -> ClientResult<MetadataResponse> {
         let cluster = self.get_cluster_metadata_cache().await?;
         let broker = cluster
             .brokers
@@ -124,7 +183,7 @@ impl Client {
     }
 
     /// List topic partition offsets.
-    pub async fn list_offsets(&self, topic: StrBytes, ptn: i32, pos: ListOffsetsPosition) -> ClientResult<i64> {
+    async fn list_offsets(&self, topic: StrBytes, ptn: i32, pos: ListOffsetsPosition) -> ClientResult<i64> {
         let cluster = self.get_cluster_metadata_cache().await?;
 
         // Get the broker responsible for the target topic/partition.
@@ -175,7 +234,7 @@ impl Client {
     }
 
     /// Fetch a batch of records from the target topic partition.
-    pub async fn fetch(&self, topic: StrBytes, ptn: i32, start: i64) -> ClientResult<Option<Vec<Record>>> {
+    async fn fetch(&self, topic: StrBytes, ptn: i32, start: i64) -> ClientResult<Option<Vec<Record>>> {
         let cluster = self.get_cluster_metadata_cache().await?;
 
         // Get the broker responsible for the target topic/partition.
@@ -230,25 +289,8 @@ impl Client {
         Ok(Some(records))
     }
 
-    /// Get the cached cluster metadata.
-    ///
-    /// If the cluster metadata has not yet been bootstrapped, then this routine will wait for
-    /// a maximum of 10s for the metadata to be bootstrapped, and will then timeout.
-    pub(crate) async fn get_cluster_metadata_cache(&self) -> ClientResult<Arc<Cluster>> {
-        let mut cluster = self.cluster.load();
-        if !*cluster.bootstrap.borrow() {
-            let mut sig = cluster.bootstrap.clone();
-            let _ = tokio::time::timeout(Duration::from_secs(10), sig.wait_for(|val| *val))
-                .await
-                .map_err(|_err| ClientError::ClusterMetadataTimeout)?
-                .map_err(|_err| ClientError::ClusterMetadataTimeout)?;
-            cluster = self.cluster.load();
-        }
-        Ok(cluster.clone())
-    }
-
     /// Find the coordinator for the given group.
-    pub async fn find_coordinator(&self, key: StrBytes, key_type: i8, broker_id: Option<i32>) -> ClientResult<FindCoordinatorResponse> {
+    async fn find_coordinator(&self, key: StrBytes, key_type: i8, broker_id: Option<i32>) -> ClientResult<FindCoordinatorResponse> {
         let cluster = self.get_cluster_metadata_cache().await?;
 
         // Get the specified broker connection, else get the first available.
@@ -288,31 +330,6 @@ impl Client {
                 }
                 Ok(res)
             })
-    }
-
-    /// Build a producer for a topic.
-    pub fn topic_producer(&self, topic: &str, acks: Acks, timeout_ms: Option<i32>, compression: Option<Compression>) -> TopicProducer {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let compression = compression.unwrap_or(Compression::None);
-        let encode_opts = RecordEncodeOptions { version: 2, compression };
-        TopicProducer {
-            _client: self.clone(),
-            tx,
-            rx,
-            cluster: self.cluster.clone(),
-            topic: StrBytes::from_string(topic.into()),
-            acks,
-            timeout_ms: timeout_ms.unwrap_or(DEFAULT_TIMEOUT),
-            encode_opts,
-            buf: BytesMut::with_capacity(1024 * 1024),
-            batch_buf: Vec::with_capacity(1024),
-            last_ptn: -1,
-        }
-    }
-
-    /// Build an admin client.
-    pub fn admin(&self) -> Admin {
-        Admin { _client: self.clone() }
     }
 }
 

@@ -24,6 +24,8 @@ tokio = { version = "1", default-features = false, features = ["io-util", "rt", 
 tokio-util = { version = "0.7", default-features = false, features = ["codec", "net", "time", "rt"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "log", "attributes"] }
 uuid = { version = "1", default-features = false, features = ["v4", "std"] }
+mockall = { version = "0.13", default-features = false, optional = true }
+async-trait = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
@@ -31,3 +33,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 [features]
 default = []
 internal = []
+mock = ["mockall"]

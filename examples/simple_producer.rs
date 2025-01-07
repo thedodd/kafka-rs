@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use kafka_rs::{Acks, Client, Compression, ListOffsetsPosition, Message, StrBytes};
+use kafka_rs::{Acks, Client, ClientApi, Compression, ListOffsetsPosition, Message, StrBytes};
 use tracing_subscriber::prelude::*;
 
 #[tokio::main(flavor = "current_thread")]

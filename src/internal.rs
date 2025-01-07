@@ -9,7 +9,19 @@ use tokio::sync::oneshot;
 use crate::client::unpack_broker_response;
 use crate::clitask::Msg;
 use crate::error::{ClientError, ClientResult};
-use crate::{Client, StrBytes};
+use crate::{Client, ClientApi, StrBytes};
+
+/// Trait definition of the internal client API.
+#[cfg_attr(feature = "mock", mockall::automock)]
+#[async_trait::async_trait]
+pub trait InternalClientApi: Send + Sync + 'static {
+    /// Get a reference to the internal ClientApi implementation.
+    fn client(&self) -> &dyn ClientApi;
+    /// Update this client's metadata based on the given payload.
+    async fn update_metadata(&self, payload: MetadataResponse);
+    /// Fetch a payload of data as a replica from the target topic partition leader.
+    async fn fetch_as_replica(&self, topic: StrBytes, ptn: i32, replica_id: i32, replica_log_start: i64, fetch_from: i64) -> ClientResult<PartitionData>;
+}
 
 /// A client wrapper for cluster internal interactions.
 #[derive(Clone)]
@@ -22,18 +34,26 @@ impl InternalClient {
     pub(crate) fn new(client: Client) -> Self {
         Self { client }
     }
+}
+
+#[async_trait::async_trait]
+impl InternalClientApi for InternalClient {
+    /// Get a reference to the internal ClientApi implementation.
+    fn client(&self) -> &dyn ClientApi {
+        &self.client
+    }
 
     /// Update this client's metadata based on the given payload.
     ///
     /// This is typically not what a normal Kafka client will want to use. For 99% of use cases, just use the
     /// clients default `MetadataPolicy::Automatic` which will bootstrap the client's metadata, and will poll
     /// the cluster for metadata changes periodically.
-    pub async fn update_metadata(&self, payload: MetadataResponse) {
+    async fn update_metadata(&self, payload: MetadataResponse) {
         let _ = self.client.tx.send(Msg::UpdateClusterMetadata(payload)).await;
     }
 
     /// Fetch a payload of data as a replica from the target topic partition leader.
-    pub async fn fetch_as_replica(&self, topic: StrBytes, ptn: i32, replica_id: i32, replica_log_start: i64, fetch_from: i64) -> ClientResult<PartitionData> {
+    async fn fetch_as_replica(&self, topic: StrBytes, ptn: i32, replica_id: i32, replica_log_start: i64, fetch_from: i64) -> ClientResult<PartitionData> {
         // Get the broker responsible for the target topic/partition.
         let cluster = self.client.get_cluster_metadata_cache().await?;
         let topic_ptns = cluster.topics.get(&topic).ok_or(ClientError::UnknownTopic(topic.to_string()))?;
