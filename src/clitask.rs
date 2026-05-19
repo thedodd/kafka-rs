@@ -12,7 +12,7 @@ use kafka_protocol::messages::metadata_response::{MetadataResponseBroker, Metada
 use kafka_protocol::messages::{BrokerId, MetadataResponse, ResponseKind};
 use kafka_protocol::protocol::StrBytes;
 use tokio::sync::{mpsc, watch};
-use tokio::time::sleep;
+use tokio::time::{sleep, interval};
 use tokio_util::sync::CancellationToken;
 
 use crate::broker::{Broker, BrokerConnInfo, BrokerPtr, BrokerResponse};
@@ -140,14 +140,58 @@ impl ClientTask {
         }
 
         tracing::debug!("kafka client initialized");
-        loop {
-            tokio::select! {
-                Some(msg) = self.rx.recv() => self.handle_client_msg(msg).await,
-                _ = self.shutdown.cancelled() => break,
+
+        let refresh_interval = match &self.metadata_policy {
+            MetadataPolicy::Automatic { interval: dur } => Some(*dur),
+            #[cfg(feature = "internal")]
+            MetadataPolicy::Manual => None,
+        };
+
+        if let Some(dur) = refresh_interval {
+            let mut ticker = interval(dur);
+            ticker.tick().await; // consume the immediate first tick
+            loop {
+                tokio::select! {
+                    Some(msg) = self.rx.recv() => self.handle_client_msg(msg).await,
+                    _ = ticker.tick() => self.refresh_metadata().await,
+                    _ = self.shutdown.cancelled() => break,
+                }
+            }
+        } else {
+            loop {
+                tokio::select! {
+                    Some(msg) = self.rx.recv() => self.handle_client_msg(msg).await,
+                    _ = self.shutdown.cancelled() => break,
+                }
             }
         }
 
         tracing::debug!("kafka client has shutdown");
+    }
+
+    /// Refresh cluster metadata from a known broker.
+    async fn refresh_metadata(&mut self) {
+        tracing::debug!("refreshing kafka cluster metadata");
+        let broker = {
+            let cluster = self.cluster.load();
+            cluster.brokers.values().next().cloned()
+        };
+        let Some(broker) = broker else {
+            // No known brokers yet; fall back to seed list.
+            self.bootstrap_cluster().await;
+            return;
+        };
+        let uid = uuid::Uuid::new_v4();
+        broker.conn.get_metadata(uid, self.resp_tx.clone().into(), self.internal).await;
+        let res = loop {
+            let Some(res) = self.resp_rx.recv().await else { return };
+            if res.id == uid { break res; }
+        };
+        match res.result {
+            Ok((_, ResponseKind::MetadataResponse(meta))) => self.update_cluster_metadata(meta),
+            Ok(_) => tracing::error!("unexpected response type when refreshing metadata"),
+            Err(err) => tracing::error!(error = ?err, "error refreshing cluster metadata"),
+        }
     }
 
     /// Handle messages recieved from client handles.
@@ -238,8 +282,18 @@ impl ClientTask {
         // in order to ensure that we are not holding onto old broker ptrs (same ID, different connection/metadata).
         cluster.topics.clear();
         for (id, topic) in meta.topics {
+            if topic.error_code != 0 {
+                tracing::warn!(error_code = topic.error_code, topic = ?id.0, "topic-level error in metadata response, skipping topic");
+                continue;
+            }
             for ptn in topic.partitions {
                 if ptn.error_code != 0 {
+                    tracing::debug!(
+                        error_code = ptn.error_code,
+                        topic = ?id.0,
+                        partition = ptn.partition_index,
+                        "partition error in metadata response, skipping partition (will retry on next refresh)"
+                    );
                     continue;
                 };
                 let ptns = cluster.topics.entry(id.0.clone()).or_default();
