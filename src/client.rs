@@ -16,7 +16,7 @@ use kafka_protocol::{
         FetchRequest, FindCoordinatorRequest, FindCoordinatorResponse, ListOffsetsRequest, MetadataResponse, ProduceRequest, ResponseHeader, ResponseKind,
     },
     protocol::StrBytes,
-    records::{Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions, TimestampType, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID, NO_SEQUENCE},
+    records::{Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions, TimestampType, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID},
     ResponseError,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -426,8 +426,12 @@ impl TopicProducer {
         // Transform the given messages into their record form.
         // offset is the intra-batch relative offset (0, 1, 2, ...) used to compute
         // last_offset_delta in the batch header; it is NOT the log offset.
-        // partition_leader_epoch / producer_id / producer_epoch / sequence must be -1
-        // for non-idempotent, non-transactional producers.
+        // sequence must equal offset so that (offset - sequence) == 0 for all records,
+        // satisfying the batch-grouping invariant in RecordBatchEncoder::encode_new_batch
+        // which keeps all records in a single batch.
+        // producer_id / producer_epoch must be -1 for non-idempotent producers; the broker
+        // ignores base_sequence (derived from sequence/offset) when producer_id == -1.
+        // partition_leader_epoch must be -1 for client-produced records.
         let timestamp = chrono::Utc::now().timestamp_millis();
         for (idx, msg) in messages.iter().enumerate() {
             self.batch_buf.push(Record {
@@ -439,7 +443,7 @@ impl TopicProducer {
                 timestamp,
                 timestamp_type: TimestampType::Creation,
                 offset: idx as i64,
-                sequence: NO_SEQUENCE,
+                sequence: idx as i32,
                 key: msg.key.clone(),
                 value: msg.value.clone(),
                 headers: msg.headers.clone(),
