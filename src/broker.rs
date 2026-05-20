@@ -279,6 +279,9 @@ impl BrokerTask {
         header.correlation_id = correlation_id;
 
         let mut body = MetadataRequest::default();
+        // Setting topics to None requests metadata for ALL topics from the broker.
+        // An empty list [] would request metadata for zero topics, returning nothing.
+        body.topics = None;
         if internal {
             // If internal, then pass along the internal tag buffer in the request.
             body.unknown_tagged_fields.insert(0, Bytes::new());
