@@ -16,7 +16,7 @@ use kafka_protocol::{
         FetchRequest, FindCoordinatorRequest, FindCoordinatorResponse, ListOffsetsRequest, MetadataResponse, ProduceRequest, ResponseHeader, ResponseKind,
     },
     protocol::StrBytes,
-    records::{Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions, TimestampType},
+    records::{Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions, TimestampType, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID, NO_SEQUENCE},
     ResponseError,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -424,18 +424,22 @@ impl TopicProducer {
         self.last_ptn = sticky_ptn;
 
         // Transform the given messages into their record form.
+        // offset is the intra-batch relative offset (0, 1, 2, ...) used to compute
+        // last_offset_delta in the batch header; it is NOT the log offset.
+        // partition_leader_epoch / producer_id / producer_epoch / sequence must be -1
+        // for non-idempotent, non-transactional producers.
         let timestamp = chrono::Utc::now().timestamp_millis();
-        for msg in messages.iter() {
+        for (idx, msg) in messages.iter().enumerate() {
             self.batch_buf.push(Record {
                 transactional: false,
                 control: false,
-                partition_leader_epoch: 0,
-                producer_id: 0,
-                producer_epoch: 0,
+                partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+                producer_id: NO_PRODUCER_ID,
+                producer_epoch: NO_PRODUCER_EPOCH,
                 timestamp,
                 timestamp_type: TimestampType::Creation,
-                offset: 0,
-                sequence: 0,
+                offset: idx as i64,
+                sequence: NO_SEQUENCE,
                 key: msg.key.clone(),
                 value: msg.value.clone(),
                 headers: msg.headers.clone(),
@@ -490,6 +494,14 @@ impl TopicProducer {
                     .ok_or(ClientError::MalformedResponse)
                     .and_then(|ptn| {
                         if ptn.error_code != 0 {
+                            if !ptn.record_errors.is_empty() || ptn.error_message.is_some() {
+                                tracing::error!(
+                                    error_code = ptn.error_code,
+                                    error_message = ?ptn.error_message,
+                                    record_errors = ?ptn.record_errors.iter().map(|e| (e.batch_index, &e.batch_index_error_message)).collect::<Vec<_>>(),
+                                    "broker rejected record batch"
+                                );
+                            }
                             return Err(ClientError::ResponseError(ptn.error_code, ResponseError::try_from_code(ptn.error_code), None));
                         }
                         debug_assert!(!messages.is_empty(), "messages len should always be validated at start of function");
