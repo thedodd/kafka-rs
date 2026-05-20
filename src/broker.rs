@@ -469,7 +469,10 @@ impl BrokerConnecting {
 
         // Set TCP nodelay on sockets.
         {
+            #[cfg(target_os = "linux")]
             let keepalive = socket2::TcpKeepalive::new().with_time(Duration::from_secs(10)).with_interval(Duration::from_secs(20)).with_retries(5);
+            #[cfg(not(target_os = "linux"))]
+            let keepalive = socket2::TcpKeepalive::new().with_time(Duration::from_secs(10)).with_interval(Duration::from_secs(20));
             let sock = socket2::SockRef::from(&conn);
             sock.set_nodelay(true)
                 .and_then(|_| sock.set_nodelay(true))
