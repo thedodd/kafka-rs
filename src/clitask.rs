@@ -12,7 +12,7 @@ use kafka_protocol::messages::metadata_response::{MetadataResponseBroker, Metada
 use kafka_protocol::messages::{BrokerId, MetadataResponse, ResponseKind};
 use kafka_protocol::protocol::StrBytes;
 use tokio::sync::{mpsc, watch};
-use tokio::time::{sleep, interval};
+use tokio::time::{interval, sleep};
 use tokio_util::sync::CancellationToken;
 
 use crate::broker::{Broker, BrokerConnInfo, BrokerPtr, BrokerResponse};
@@ -185,7 +185,9 @@ impl ClientTask {
         broker.conn.get_metadata(uid, self.resp_tx.clone().into(), self.internal).await;
         let res = loop {
             let Some(res) = self.resp_rx.recv().await else { return };
-            if res.id == uid { break res; }
+            if res.id == uid {
+                break res;
+            }
         };
         match res.result {
             Ok((_, ResponseKind::MetadataResponse(meta))) => self.update_cluster_metadata(meta),
