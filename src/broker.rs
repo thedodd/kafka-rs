@@ -416,6 +416,10 @@ impl BrokerTask {
                 for (key, ver) in res.api_keys.iter() {
                     self.api_versions.insert(*key, (ver.min_version, ver.max_version));
                 }
+                // Cap Fetch at v12: v13+ uses topic UUIDs instead of names in responses, but this client matches responses by topic name.
+                if let Some(entry) = self.api_versions.get_mut(&(ApiKey::FetchKey as i16)) {
+                    entry.1 = entry.1.min(12);
+                }
                 tracing::trace!(?self.api_versions, "updated api versions cache info");
             }
         }
