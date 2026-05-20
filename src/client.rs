@@ -470,7 +470,6 @@ impl TopicProducer {
         };
 
         // Handle response.
-        // TODO: check for error codes in response.
         res.result
             .map_err(ClientError::BrokerError)
             .and_then(|res| {
@@ -487,14 +486,16 @@ impl TopicProducer {
                 res.responses
                     .iter()
                     .find(|topic| topic.0 .0 == self.topic)
-                    .and_then(|val| {
-                        val.1.partition_responses.first().map(|val| {
-                            debug_assert!(!messages.is_empty(), "messages len should always be validated at start of function");
-                            let last_offset = val.base_offset + (messages.len() - 1) as i64;
-                            (val.base_offset, last_offset)
-                        })
-                    })
+                    .and_then(|val| val.1.partition_responses.first())
                     .ok_or(ClientError::MalformedResponse)
+                    .and_then(|ptn| {
+                        if ptn.error_code != 0 {
+                            return Err(ClientError::ResponseError(ptn.error_code, ResponseError::try_from_code(ptn.error_code), None));
+                        }
+                        debug_assert!(!messages.is_empty(), "messages len should always be validated at start of function");
+                        let last_offset = ptn.base_offset + (messages.len() - 1) as i64;
+                        Ok((ptn.base_offset, last_offset))
+                    })
             })
     }
 }
