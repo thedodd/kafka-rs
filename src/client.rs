@@ -263,7 +263,6 @@ impl ClientApi for Client {
         broker.conn.fetch(uid, req, tx).await;
 
         // Unpack response & handle errors.
-        // TODO: check for error codes in response.
         let batch_opt = unpack_broker_response(rx)
             .await
             .and_then(|(_, res)| {
@@ -275,11 +274,36 @@ impl ClientApi for Client {
                 }
             })
             .and_then(|res| {
-                res.responses
+                let topic_res = res
+                    .responses
                     .iter()
                     .find(|topic_res| topic_res.topic.0 == topic)
-                    .and_then(|topic_res| topic_res.partitions.iter().find(|ptn_res| ptn_res.partition_index == ptn).map(|ptn_res| ptn_res.records.clone()))
-                    .ok_or(ClientError::MalformedResponse)
+                    .ok_or_else(|| {
+                        let names: Vec<&str> = res.responses.iter().map(|r| r.topic.0.as_str()).collect();
+                        tracing::error!(requested = topic.as_str(), response_topics = ?names, "fetch response did not contain requested topic");
+                        ClientError::MalformedResponse
+                    })?;
+
+                let ptn_res = topic_res
+                    .partitions
+                    .iter()
+                    .find(|ptn_res| ptn_res.partition_index == ptn)
+                    .ok_or_else(|| {
+                        tracing::error!(topic = topic.as_str(), partition = ptn, "fetch response did not contain requested partition");
+                        ClientError::MalformedResponse
+                    })?;
+
+                if ptn_res.error_code != 0 {
+                    tracing::error!(
+                        topic = topic.as_str(),
+                        partition = ptn,
+                        error_code = ptn_res.error_code,
+                        error = ?ResponseError::try_from_code(ptn_res.error_code),
+                        "broker returned error for fetch partition"
+                    );
+                    return Err(ClientError::ResponseError(ptn_res.error_code, ResponseError::try_from_code(ptn_res.error_code), None));
+                }
+                Ok(ptn_res.records.clone())
             })?;
 
         // If some data was returned, then decode the batch.
