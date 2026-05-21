@@ -212,7 +212,6 @@ impl ClientApi for Client {
         broker.conn.list_offsets(uid, req, tx).await;
 
         // Unpack response & handle errors.
-        // TODO: check for error codes in response.
         let offset = unpack_broker_response(rx)
             .await
             .and_then(|(_, res)| {
@@ -223,11 +222,26 @@ impl ClientApi for Client {
                 }
             })
             .and_then(|res| {
-                res.topics
-                    .iter()
-                    .find(|topic_res| topic_res.name.0 == topic)
-                    .and_then(|topic_res| topic_res.partitions.iter().find(|ptn_res| ptn_res.partition_index == ptn).map(|ptn_res| ptn_res.offset))
-                    .ok_or(ClientError::MalformedResponse)
+                let topic_res = res.topics.iter().find(|topic_res| topic_res.name.0 == topic).ok_or_else(|| {
+                    let names: Vec<&str> = res.topics.iter().map(|t| t.name.0.as_str()).collect();
+                    tracing::error!(requested = topic.as_str(), response_topics = ?names, "list_offsets response did not contain requested topic");
+                    ClientError::MalformedResponse
+                })?;
+                let ptn_res = topic_res.partitions.iter().find(|ptn_res| ptn_res.partition_index == ptn).ok_or_else(|| {
+                    tracing::error!(topic = topic.as_str(), partition = ptn, "list_offsets response did not contain requested partition");
+                    ClientError::MalformedResponse
+                })?;
+                if ptn_res.error_code != 0 {
+                    tracing::error!(
+                        topic = topic.as_str(),
+                        partition = ptn,
+                        error_code = ptn_res.error_code,
+                        error = ?ResponseError::try_from_code(ptn_res.error_code),
+                        "broker returned error for list_offsets partition"
+                    );
+                    return Err(ClientError::ResponseError(ptn_res.error_code, ResponseError::try_from_code(ptn_res.error_code), None));
+                }
+                Ok(ptn_res.offset)
             })?;
 
         Ok(offset)
@@ -245,14 +259,17 @@ impl ClientApi for Client {
         // Build request.
         let uid = uuid::Uuid::new_v4();
         let mut req = FetchRequest::default();
-        req.max_bytes = 1024i32.pow(2);
+        req.max_bytes = 1024i32.pow(2) * 32; // 32 MiB total
         req.max_wait_ms = 10_000;
         // req.isolation_level = 0; // TODO: update this.
         let mut req_topic = FetchTopic::default();
         req_topic.topic = topic.clone().into();
         let mut req_ptn = FetchPartition::default();
         req_ptn.partition = ptn;
-        req_ptn.partition_max_bytes = 1024i32.pow(2);
+
+        // 16 MiB per partition: matches max.message.bytes=4MiB topic config with headroom
+        req_ptn.partition_max_bytes = 1024i32.pow(2) * 16;
+
         req_ptn.fetch_offset = start;
         req_topic.partitions.push(req_ptn);
         req.topics.push(req_topic);
