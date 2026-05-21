@@ -279,6 +279,9 @@ impl BrokerTask {
         header.correlation_id = correlation_id;
 
         let mut body = MetadataRequest::default();
+        // Setting topics to None requests metadata for ALL topics from the broker.
+        // An empty list [] would request metadata for zero topics, returning nothing.
+        body.topics = None;
         if internal {
             // If internal, then pass along the internal tag buffer in the request.
             body.unknown_tagged_fields.insert(0, Bytes::new());
@@ -413,6 +416,10 @@ impl BrokerTask {
                 for (key, ver) in res.api_keys.iter() {
                     self.api_versions.insert(*key, (ver.min_version, ver.max_version));
                 }
+                // Cap Fetch at v12: v13+ uses topic UUIDs instead of names in responses, but this client matches responses by topic name.
+                if let Some(entry) = self.api_versions.get_mut(&(ApiKey::FetchKey as i16)) {
+                    entry.1 = entry.1.min(12);
+                }
                 tracing::trace!(?self.api_versions, "updated api versions cache info");
             }
         }
@@ -462,7 +469,10 @@ impl BrokerConnecting {
 
         // Set TCP nodelay on sockets.
         {
+            #[cfg(target_os = "linux")]
             let keepalive = socket2::TcpKeepalive::new().with_time(Duration::from_secs(10)).with_interval(Duration::from_secs(20)).with_retries(5);
+            #[cfg(not(target_os = "linux"))]
+            let keepalive = socket2::TcpKeepalive::new().with_time(Duration::from_secs(10)).with_interval(Duration::from_secs(20));
             let sock = socket2::SockRef::from(&conn);
             sock.set_nodelay(true)
                 .and_then(|_| sock.set_nodelay(true))

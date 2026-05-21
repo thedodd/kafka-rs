@@ -16,7 +16,7 @@ use kafka_protocol::{
         FetchRequest, FindCoordinatorRequest, FindCoordinatorResponse, ListOffsetsRequest, MetadataResponse, ProduceRequest, ResponseHeader, ResponseKind,
     },
     protocol::StrBytes,
-    records::{Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions, TimestampType},
+    records::{Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions, TimestampType, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID},
     ResponseError,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -212,7 +212,6 @@ impl ClientApi for Client {
         broker.conn.list_offsets(uid, req, tx).await;
 
         // Unpack response & handle errors.
-        // TODO: check for error codes in response.
         let offset = unpack_broker_response(rx)
             .await
             .and_then(|(_, res)| {
@@ -223,11 +222,26 @@ impl ClientApi for Client {
                 }
             })
             .and_then(|res| {
-                res.topics
-                    .iter()
-                    .find(|topic_res| topic_res.name.0 == topic)
-                    .and_then(|topic_res| topic_res.partitions.iter().find(|ptn_res| ptn_res.partition_index == ptn).map(|ptn_res| ptn_res.offset))
-                    .ok_or(ClientError::MalformedResponse)
+                let topic_res = res.topics.iter().find(|topic_res| topic_res.name.0 == topic).ok_or_else(|| {
+                    let names: Vec<&str> = res.topics.iter().map(|t| t.name.0.as_str()).collect();
+                    tracing::error!(requested = topic.as_str(), response_topics = ?names, "list_offsets response did not contain requested topic");
+                    ClientError::MalformedResponse
+                })?;
+                let ptn_res = topic_res.partitions.iter().find(|ptn_res| ptn_res.partition_index == ptn).ok_or_else(|| {
+                    tracing::error!(topic = topic.as_str(), partition = ptn, "list_offsets response did not contain requested partition");
+                    ClientError::MalformedResponse
+                })?;
+                if ptn_res.error_code != 0 {
+                    tracing::error!(
+                        topic = topic.as_str(),
+                        partition = ptn,
+                        error_code = ptn_res.error_code,
+                        error = ?ResponseError::try_from_code(ptn_res.error_code),
+                        "broker returned error for list_offsets partition"
+                    );
+                    return Err(ClientError::ResponseError(ptn_res.error_code, ResponseError::try_from_code(ptn_res.error_code), None));
+                }
+                Ok(ptn_res.offset)
             })?;
 
         Ok(offset)
@@ -245,14 +259,17 @@ impl ClientApi for Client {
         // Build request.
         let uid = uuid::Uuid::new_v4();
         let mut req = FetchRequest::default();
-        req.max_bytes = 1024i32.pow(2);
+        req.max_bytes = 1024i32.pow(2) * 32; // 32 MiB total
         req.max_wait_ms = 10_000;
         // req.isolation_level = 0; // TODO: update this.
         let mut req_topic = FetchTopic::default();
         req_topic.topic = topic.clone().into();
         let mut req_ptn = FetchPartition::default();
         req_ptn.partition = ptn;
-        req_ptn.partition_max_bytes = 1024i32.pow(2);
+
+        // 16 MiB per partition: matches max.message.bytes=4MiB topic config with headroom
+        req_ptn.partition_max_bytes = 1024i32.pow(2) * 16;
+
         req_ptn.fetch_offset = start;
         req_topic.partitions.push(req_ptn);
         req.topics.push(req_topic);
@@ -263,7 +280,6 @@ impl ClientApi for Client {
         broker.conn.fetch(uid, req, tx).await;
 
         // Unpack response & handle errors.
-        // TODO: check for error codes in response.
         let batch_opt = unpack_broker_response(rx)
             .await
             .and_then(|(_, res)| {
@@ -275,16 +291,36 @@ impl ClientApi for Client {
                 }
             })
             .and_then(|res| {
-                res.responses
-                    .iter()
-                    .find(|topic_res| topic_res.topic.0 == topic)
-                    .and_then(|topic_res| topic_res.partitions.iter().find(|ptn_res| ptn_res.partition_index == ptn).map(|ptn_res| ptn_res.records.clone()))
-                    .ok_or(ClientError::MalformedResponse)
+                let topic_res = res.responses.iter().find(|topic_res| topic_res.topic.0 == topic).ok_or_else(|| {
+                    let names: Vec<&str> = res.responses.iter().map(|r| r.topic.0.as_str()).collect();
+                    tracing::error!(requested = topic.as_str(), response_topics = ?names, "fetch response did not contain requested topic");
+                    ClientError::MalformedResponse
+                })?;
+
+                let ptn_res = topic_res.partitions.iter().find(|ptn_res| ptn_res.partition_index == ptn).ok_or_else(|| {
+                    tracing::error!(topic = topic.as_str(), partition = ptn, "fetch response did not contain requested partition");
+                    ClientError::MalformedResponse
+                })?;
+
+                if ptn_res.error_code != 0 {
+                    tracing::error!(
+                        topic = topic.as_str(),
+                        partition = ptn,
+                        error_code = ptn_res.error_code,
+                        error = ?ResponseError::try_from_code(ptn_res.error_code),
+                        "broker returned error for fetch partition"
+                    );
+                    return Err(ClientError::ResponseError(ptn_res.error_code, ResponseError::try_from_code(ptn_res.error_code), None));
+                }
+                Ok(ptn_res.records.clone())
             })?;
 
         // If some data was returned, then decode the batch.
         let Some(mut batch) = batch_opt else { return Ok(None) };
-        let records = RecordBatchDecoder::decode(&mut batch).map_err(|_| ClientError::MalformedResponse)?;
+        let records = RecordBatchDecoder::decode(&mut batch).map_err(|err| {
+            tracing::error!(topic = topic.as_str(), partition = ptn, error = ?err, "failed to decode record batch from fetch response");
+            ClientError::MalformedResponse
+        })?;
 
         Ok(Some(records))
     }
@@ -424,18 +460,26 @@ impl TopicProducer {
         self.last_ptn = sticky_ptn;
 
         // Transform the given messages into their record form.
+        // offset is the intra-batch relative offset (0, 1, 2, ...) used to compute
+        // last_offset_delta in the batch header; it is NOT the log offset.
+        // sequence must equal offset so that (offset - sequence) == 0 for all records,
+        // satisfying the batch-grouping invariant in RecordBatchEncoder::encode_new_batch
+        // which keeps all records in a single batch.
+        // producer_id / producer_epoch must be -1 for non-idempotent producers; the broker
+        // ignores base_sequence (derived from sequence/offset) when producer_id == -1.
+        // partition_leader_epoch must be -1 for client-produced records.
         let timestamp = chrono::Utc::now().timestamp_millis();
-        for msg in messages.iter() {
+        for (idx, msg) in messages.iter().enumerate() {
             self.batch_buf.push(Record {
                 transactional: false,
                 control: false,
-                partition_leader_epoch: 0,
-                producer_id: 0,
-                producer_epoch: 0,
+                partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+                producer_id: NO_PRODUCER_ID,
+                producer_epoch: NO_PRODUCER_EPOCH,
                 timestamp,
                 timestamp_type: TimestampType::Creation,
-                offset: 0,
-                sequence: 0,
+                offset: idx as i64,
+                sequence: idx as i32,
                 key: msg.key.clone(),
                 value: msg.value.clone(),
                 headers: msg.headers.clone(),
@@ -470,7 +514,6 @@ impl TopicProducer {
         };
 
         // Handle response.
-        // TODO: check for error codes in response.
         res.result
             .map_err(ClientError::BrokerError)
             .and_then(|res| {
@@ -487,14 +530,24 @@ impl TopicProducer {
                 res.responses
                     .iter()
                     .find(|topic| topic.0 .0 == self.topic)
-                    .and_then(|val| {
-                        val.1.partition_responses.first().map(|val| {
-                            debug_assert!(!messages.is_empty(), "messages len should always be validated at start of function");
-                            let last_offset = val.base_offset + (messages.len() - 1) as i64;
-                            (val.base_offset, last_offset)
-                        })
-                    })
+                    .and_then(|val| val.1.partition_responses.first())
                     .ok_or(ClientError::MalformedResponse)
+                    .and_then(|ptn| {
+                        if ptn.error_code != 0 {
+                            if !ptn.record_errors.is_empty() || ptn.error_message.is_some() {
+                                tracing::error!(
+                                    error_code = ptn.error_code,
+                                    error_message = ?ptn.error_message,
+                                    record_errors = ?ptn.record_errors.iter().map(|e| (e.batch_index, &e.batch_index_error_message)).collect::<Vec<_>>(),
+                                    "broker rejected record batch"
+                                );
+                            }
+                            return Err(ClientError::ResponseError(ptn.error_code, ResponseError::try_from_code(ptn.error_code), None));
+                        }
+                        debug_assert!(!messages.is_empty(), "messages len should always be validated at start of function");
+                        let last_offset = ptn.base_offset + (messages.len() - 1) as i64;
+                        Ok((ptn.base_offset, last_offset))
+                    })
             })
     }
 }
