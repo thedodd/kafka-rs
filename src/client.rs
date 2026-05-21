@@ -300,7 +300,10 @@ impl ClientApi for Client {
 
         // If some data was returned, then decode the batch.
         let Some(mut batch) = batch_opt else { return Ok(None) };
-        let records = RecordBatchDecoder::decode(&mut batch).map_err(|_| ClientError::MalformedResponse)?;
+        let records = RecordBatchDecoder::decode(&mut batch).map_err(|err| {
+            tracing::error!(topic = topic.as_str(), partition = ptn, error = ?err, "failed to decode record batch from fetch response");
+            ClientError::MalformedResponse
+        })?;
 
         Ok(Some(records))
     }
